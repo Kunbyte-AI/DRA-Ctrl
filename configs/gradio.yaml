@@ -5,8 +5,8 @@ log_dir: outputs
 img_size: 512
 
 # model
-i2v_model_root: /home/caohengyuan/iLego_chy/cache/HunyuanVideo-I2V # ckpts/HunyuanVideo-I2V
-depth_anything_model_root: /home/caohengyuan/iLego_chy/cache/depth-anything-small-hf # ckpts/depth-anything-small-hf
+i2v_model_root: ckpts/HunyuanVideo-I2V
+depth_anything_model_root: ckpts/depth-anything-small-hf
 task: subject_driven
 canny_model_root: ckpts/canny.safetensors
 coloring_model_root: ckpts/coloring.safetensors

@@ -44,6 +44,28 @@ We use [the community fork](https://huggingface.co/hunyuanvideo-community/Hunyua
 
 You can download the LoRA weights for various tasks of DRA-Ctrl at [this link]().
 
+The checkpoint directory is shown below.
+```
+DRA-Ctrl/
+└── ckpts/
+    ├── HunyuanVideo-I2V/
+    |   ├── image_processor/
+    |   ├── scheduler/
+    |       ...
+    ├── depth-anything-small-hf
+    |   ├── model.safetensors
+    |       ...
+    ├── canny.safetensors
+    ├── coloring.safetensors
+    ├── deblurring.safetensors
+    ├── depth.safetensors
+    ├── depth_pred.safetensors
+    ├── fill.safetensors
+    ├── sr.safetensors
+    ├── subject_driven.safetensors
+    └── style_transfer.safetensors
+```
+
 ### Get Started
 
 ```
