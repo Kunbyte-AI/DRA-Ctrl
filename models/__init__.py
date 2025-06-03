@@ -1,0 +1,1 @@
+from .hyvideo.transformer_hunyuan_video_i2v import HunyuanVideoTransformer3DModel

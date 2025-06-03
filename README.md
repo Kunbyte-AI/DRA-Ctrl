@@ -14,7 +14,7 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 
 ## ✅ TODOs
 
-- [ ] release code
+- [x] release code
 - [ ] release checkpoints
 
 ## 🔍 Introduction
@@ -30,26 +30,47 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 > These results highlight the untapped potential of large-scale video generators for broader visual applications. 
 > `DRA-Ctrl` provides new insights into reusing resource-intensive video models and lays foundation for future unified generative models across visual modalities.
 
-![](asset/teaser.png)
+![](assets/teaser.png)
 
 ## 🚀 Quick Start
 
 ### Dependencies
+```
+conda create --name dra_ctrl python=3.12
+pip install -r requirements.txt
+```
 ### Checkpoints
+We use [the community fork](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-I2V)  for Diffusers-format weights on [tencent/HunyuanVideo-I2V](https://huggingface.co/tencent/HunyuanVideo-I2V) as the initialization parameters for the model.
+
+You can download the LoRA weights for various tasks of DRA-Ctrl at [this link]().
+
 ### Get Started
-```
-With cmd
-```
 
 ```
-With Gradio
+python gradio_app.py --config configs/gradio.yaml
 ```
+
+For easier testing, in ​spatially-aligned image generation tasks, when passing the condition image to `gradio_app`, there's no need to manually input edge maps, depth maps, or other condition images - only the original image is required. The corresponding condition images will be automatically extracted.
+
+You can use the `*_test.jpg` or `*_test.png` images from the assets folder as ​condition images​ for input to `gradio_app`, which will generate the following examples:
+
+Examples:
+|               Task              |          Condition Image         |                                                                 Target Prompt                                                                |                                                     Condition Image Prompt                                                    |           Target Image           |
+|:-------------------------------:|:--------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------:|:--------------------------------:|
+|          Canny to Image         |      ![](assets/canny_ci.png)     |                   Mosquito frozen in clear ice cube on sand, glowing sunset casting golden light with misty halo around ice                  |                                                               -                                                               |      ![](assets/canny_ti.png)     |
+|           Colorization          |    ![](assets/coloring_ci.png)    |          A vibrant young woman with rainbow glasses, yellow eyes, and colorful feather accessory against a bright yellow background          |                                                               -                                                               |    ![](assets/coloring_ti.png)    |
+|            Deblurring           |   ![](assets/deblurring_ci.png)   |                 Vibrant rainbow ball creates dramatic splash in clear water, bubbles swirling against crisp white background                 |                                                               -                                                               |   ![](assets/deblurring_ti.png)   |
+|          Depth to Image         |      ![](assets/depth_ci.png)     |                  Golden-brown cat-shaped bread loaf with closed eyes rests on wooden table, soft kitchen blur in background                  |                                                               -                                                               |      ![](assets/depth_ti.png)     |
+|         Depth Prediction        |   ![](assets/depth_pred_ci.png)   |                 Steaming bowl of ramen with pork slices, soft-boiled egg, greens, and scallions in rich broth on wooden table                |                                                               -                                                               |   ![](assets/depth_pred_ti.png)   |
+|         In/Out-painting         |      ![](assets/fill_ci.png)      |                          Mona Lisa dons a medical mask, her enigmatic smile now concealed beneath crisp white fabric                         |                                                               -                                                               |      ![](assets/fill_ti.png)      |
+|         Super-resolution        |       ![](assets/sr_ci.png)       |          Crispy buffalo wings and golden fries rest on a red-and-white checkered paper lining a gleaming metal tray, with creamy dip         |                                                               -                                                               |       ![](assets/sr_ti.png)       |
+| Subject-driven image generation | ![](assets/subject_driven_ci.jpg) |                                                            The woman stands in a snowy forest, captured in a half-portrait outfit                                                            |                                                             Woman in cream knit sweater sits calmly by a crackling fireplace, surrounded by warm candlelight and rustic wooden shelves                                                             | ![](assets/subject_driven_ti.png) |
+|          Style Transfer         | ![](assets/style_transfer_ci.jpg) | bitmoji style. An orange cat sits quietly on the stone slab. Beside it are the green grasses. With its ears perked up, it looks to one side. | An orange cat sits quietly on the stone slab. Beside it are the green grasses. With its ears perked up, it looks to one side. | ![](assets/style_transfer_ti.png) |
 
 ## 📋 Citation
 
 If you find our work helpful, please cite:
 ```
-bibtex
 @misc{cao2025dimensionreductionattackvideogenerative,
       title={Dimension-Reduction Attack! Video Generative Models are Experts on Controllable Image Synthesis}, 
       author={Hengyuan Cao and Yutong Feng and Biao Gong and Yijing Tian and Yunhong Lu and Chuang Liu and Bin Wang},
@@ -60,3 +81,6 @@ bibtex
       url={https://arxiv.org/abs/2505.23325}, 
       }
 ```
+
+## Acknowledgements
+We would like to thank the contributors to the [HunyuanVideo](https://github.com/Tencent-Hunyuan/HunyuanVideo), [HunyuanVideo-I2V](https://github.com/Tencent-Hunyuan/HunyuanVideo-I2V), [diffusers](https://github.com/huggingface/diffusers) and [HuggingFace](https://huggingface.co/) repositories, for their open research and exploration.

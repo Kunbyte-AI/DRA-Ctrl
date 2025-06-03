@@ -1,0 +1,31 @@
+# logging
+log_dir: outputs
+
+# data
+img_size: 512
+
+# model
+i2v_model_root: /home/caohengyuan/iLego_chy/cache/HunyuanVideo-I2V # ckpts/HunyuanVideo-I2V
+depth_anything_model_root: /home/caohengyuan/iLego_chy/cache/depth-anything-small-hf # ckpts/depth-anything-small-hf
+task: subject_driven
+canny_model_root: ckpts/canny.safetensors
+coloring_model_root: ckpts/coloring.safetensors
+deblurring_model_root: ckpts/deblurring.safetensors
+depth_model_root: ckpts/depth.safetensors
+depth_pred_model_root: ckpts/depth_pred.safetensors
+fill_model_root: ckpts/fill.safetensors
+sr_model_root: ckpts/sr.safetensors
+subject_driven_model_root: ckpts/subject_driven.safetensors
+style_transfer_model_root: ckpts/style_transfer.safetensors
+
+# fill
+fill_x1: 170
+fill_x2: 300
+fill_y1: 190
+fill_y2: 290
+inpainting: True
+
+# inference
+num_inference_steps: 50
+guidance_scale: 6.0
+random_seed: 42

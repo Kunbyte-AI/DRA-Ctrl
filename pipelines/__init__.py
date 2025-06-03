@@ -1,0 +1,1 @@
+from .pipeline_hunyuan_video_i2v import HunyuanVideoImageToVideoPipeline
