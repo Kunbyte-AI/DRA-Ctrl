@@ -104,5 +104,10 @@ If you find our work helpful, please cite:
       }
 ```
 
+## Attribution
+This project uses code from the following sources:
+- [diffusers/models/transformers/transformer_hunyuan_video](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_hunyuan_video.py) - Copyright 2024 The HunyuanVideo Team and The HuggingFace Team (Apache 2.0 licensed).
+- [diffusers/pipelines/hunyuan_video/pipeline_hunyuan_video_image2video](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/hunyuan_video/pipeline_hunyuan_video_image2video.py) - Copyright 2024 The HunyuanVideo Team and The HuggingFace Team (Apache 2.0 licensed).
+
 ## Acknowledgements
 We would like to thank the contributors to the [HunyuanVideo](https://github.com/Tencent-Hunyuan/HunyuanVideo), [HunyuanVideo-I2V](https://github.com/Tencent-Hunyuan/HunyuanVideo-I2V), [diffusers](https://github.com/huggingface/diffusers) and [HuggingFace](https://huggingface.co/) repositories, for their open research and exploration.

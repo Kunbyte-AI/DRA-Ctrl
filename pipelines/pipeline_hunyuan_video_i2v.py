@@ -1,5 +1,4 @@
-# Copyright 2024-2025 The HunyuanVideo Team and The HuggingFace Team. All rights reserved.
-# Copyright 2025 The Kunbyte AI Team. All rights reserved.
+# Copyright 2024 The HunyuanVideo Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by [Hengyuan Cao] in 2025.
 
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union

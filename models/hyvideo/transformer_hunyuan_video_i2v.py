@@ -1,5 +1,4 @@
-# Copyright 2024-2025 The Hunyuan Team and The HuggingFace Team. All rights reserved.
-# Copyright 2025 The Kunbyte AI Team. All rights reserved.
+# Copyright 2024 The Hunyuan Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by [Hengyuan Cao] in 2025.
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -38,7 +38,6 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle, FP32LayerNorm
 from torch.nn.utils.rnn import pad_sequence
-import ops
 
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -130,26 +129,6 @@ class HunyuanVideoAttnProcessor2_0:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # all-to-all for sequence parallel
-        if ops.get_sequence_parallel_world_size() > 1:
-            if encoder_hidden_states is None:
-                query, key, value = ops.pre_process_for_sequence_parallel_attn(query, key, value)
-            else:
-                query_img, key_img, value_img = ops.pre_process_for_sequence_parallel_attn(
-                    query[:, : -encoder_hidden_states.shape[1]],
-                    key[:, : -encoder_hidden_states.shape[1]],
-                    value[:, : -encoder_hidden_states.shape[0]]
-                )
-                query_txt, key_txt, value_txt = ops.pre_process_for_sequence_parallel_attn(
-                    query[:, -encoder_hidden_states.shape[1] :],
-                    key[:, -encoder_hidden_states.shape[1] :],
-                    value[:, -encoder_hidden_states.shape[1] :]
-                )
-                encoder_hidden_states_full_seqlen = query_txt.shape[1]
-                query = torch.cat((query_img, query_txt), dim=1)
-                key = torch.cat((key_img, key_txt), dim=1)
-                value = torch.cat((value_img, value_txt), dim=1)
-
         # 5. Attention
         if FLASH_ATTN_AVALIABLE:
             if attention_mask is None:
@@ -205,16 +184,6 @@ class HunyuanVideoAttnProcessor2_0:
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             ) # use sdpa in torch may generate black output, upgrade to >=2.5.1 may solve this
             hidden_states = hidden_states.transpose(1, 2)
-
-        # all-to-all for sequence-parallel
-        if ops.get_sequence_parallel_world_size() > 1:
-            if encoder_hidden_states is None:
-                hidden_states = ops.post_process_for_sequence_parallel_attn(hidden_states).contiguous(),
-            else:
-                hidden_states = torch.cat([
-                    ops.post_process_for_sequence_parallel_attn(hidden_states[:, : -encoder_hidden_states_full_seqlen]).contiguous(),
-                    ops.post_process_for_sequence_parallel_attn(hidden_states[:, -encoder_hidden_states_full_seqlen :]).contiguous()
-                ], dim=1)
 
         # flatten num_head * head_dim
         hidden_states = hidden_states.flatten(2, 3)
