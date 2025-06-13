@@ -350,10 +350,13 @@ class HunyuanVideoImageToVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoader
                 image_embed_list = image_embed_list[:, ::image_embed_interleave, :]
                 image_attention_mask_list = image_attention_mask_list[:, ::image_embed_interleave]
 
-            assert (
+            if not (
                 prompt_embed_list.shape[0] == prompt_attention_mask_list.shape[0]
                 and image_embed_list.shape[0] == image_attention_mask_list.shape[0]
-            )
+            ):
+                raise ValueError(
+                    "Input tensors have mismatched batch dimensions."
+                )
 
             prompt_embeds = torch.cat([image_embed_list, prompt_embed_list], dim=1)
             prompt_attention_mask = torch.cat([image_attention_mask_list, prompt_attention_mask_list], dim=1)

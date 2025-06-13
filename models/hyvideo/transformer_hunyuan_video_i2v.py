@@ -137,9 +137,9 @@ class HunyuanVideoAttnProcessor2_0:
                 B, S, H, D = query.size()
                 unit_img_seq_len = 1024
                 unit_txt_seq_len = 144 + 252
-                assert (unit_img_seq_len*4+unit_txt_seq_len == S or 
-                    unit_img_seq_len*4+unit_txt_seq_len*2 == S), \
-                    "Get wrong sequence length."
+                if not (unit_img_seq_len*4+unit_txt_seq_len == S or 
+                    unit_img_seq_len*4+unit_txt_seq_len*2 == S):
+                    raise ValueError("Get wrong sequence length.")
                 if S == unit_img_seq_len*4+unit_txt_seq_len:
                     seg_start = [0, unit_img_seq_len, unit_img_seq_len*4]
                     seg_end = [unit_img_seq_len, unit_img_seq_len*4, unit_img_seq_len*4+unit_txt_seq_len]
