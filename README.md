@@ -9,13 +9,14 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 [![arXiv](https://img.shields.io/badge/arXiv-2505.23325-b31b1b.svg)](https://arxiv.org/abs/2505.23325)
 [![Paper](https://img.shields.io/badge/Paper-PDF-green.svg)](https://arxiv.org/pdf/2505.23325)
 [![Project](https://img.shields.io/badge/Project-Page-blue)](https://dra-ctrl-2025.github.io/DRA-Ctrl/)
-[![HuggingFace](https://img.shields.io/badge/🤗-HF%20Model-yellow)](https://huggingface.co/your-model)
+[![HuggingFace](https://img.shields.io/badge/🤗-HF%20Model-yellow)](https://huggingface.co/Kunbyte/DRA-Ctrl)
+[![HuggingFace](https://img.shields.io/badge/🤗-HF%20Space-yellow)](https://huggingface.co/spaces/Kunbyte/DRA-Ctrl)
 [![GitHub](https://img.shields.io/badge/GitHub-Repo-black)](https://github.com/Kunbyte-AI/DRA-Ctrl)
 
 ## ✅ TODOs
 
 - [x] release code
-- [ ] release checkpoints
+- [x] release checkpoints
 
 ## 🔍 Introduction
 
@@ -42,7 +43,7 @@ pip install -r requirements.txt
 ### Checkpoints
 We use [the community fork](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-I2V)  for Diffusers-format weights on [tencent/HunyuanVideo-I2V](https://huggingface.co/tencent/HunyuanVideo-I2V) as the initialization parameters for the model.
 
-You can download the LoRA weights for various tasks of DRA-Ctrl at [this link]().
+You can download the LoRA weights for various tasks of DRA-Ctrl at [this link](https://huggingface.co/Kunbyte/DRA-Ctrl).
 
 The checkpoint directory is shown below.
 ```
