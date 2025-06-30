@@ -17,6 +17,7 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 
 - [x] release code
 - [x] release checkpoints
+- [ ] using FramePack as base model
 
 ## 🔍 Introduction
 
@@ -34,6 +35,9 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 ![](assets/teaser.png)
 
 ## 🚀 Quick Start
+
+### Hardware Requirement
+Our method is implemented on Linux with H800 80GB GPU.
 
 ### Dependencies
 ```
