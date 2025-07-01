@@ -7,7 +7,7 @@ img_size: 512
 # model
 i2v_model_root: ckpts/HunyuanVideo-I2V
 depth_anything_model_root: ckpts/depth-anything-small-hf
-task: subject_driven
+task: subject_driven # choose from canny, coloring, deblurring, depth, depth_pred, fill, sr, subject_driven, style_transfer
 canny_model_root: ckpts/canny.safetensors
 coloring_model_root: ckpts/coloring.safetensors
 deblurring_model_root: ckpts/deblurring.safetensors
@@ -28,4 +28,4 @@ inpainting: True
 # inference
 num_inference_steps: 50
 guidance_scale: 6.0
-random_seed: 42
+random_seed: 0

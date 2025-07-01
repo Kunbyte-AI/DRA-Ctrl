@@ -3,7 +3,8 @@ torchvision==0.19.1+cu124
 diffusers==0.33.1
 transformers==4.45.0
 flash-attn==2.7.3
-gradio
+gradio==5.33.2
 omegaconf
 peft
 opencv-python
+imageio[ffmpeg]

@@ -649,6 +649,7 @@ class HunyuanVideoImageToVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoader
         frame_gap: Union[int, None] = None,
         mixup: bool = False,
         mixup_num_imgs: Union[int, None] = None,
+        enhance_tp: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -899,6 +900,7 @@ class HunyuanVideoImageToVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoader
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                     frame_gap=int(frame_gap / 4) if frame_gap is not None else frame_gap,
+                    enhance_tp=enhance_tp,
                 )[0]
 
                 if do_true_cfg:

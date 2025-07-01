@@ -43,7 +43,8 @@ try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     FLASH_ATTN_AVALIABLE = True
 except:
-    FLASH_ATTN_AVALIABLE = False
+    # currently we force to use flash-attn for correct attention masking strategy
+    FLASH_ATTN_AVALIABLE = True
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -64,6 +65,7 @@ class HunyuanVideoAttnProcessor2_0:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        enhance_tp: bool = False,
     ) -> torch.Tensor:
         if attn.add_q_proj is None and encoder_hidden_states is not None:
             hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
@@ -154,7 +156,7 @@ class HunyuanVideoAttnProcessor2_0:
                 k_lens = torch.tensor([sum([u[seg_start[seg]:seg_end[seg]].long().sum().item() for seg in segs]) for u in valid_indices for segs in k_segs], 
                                         dtype=torch.int32, device=valid_indices.device)
                 query = torch.cat([u[i:j][v[i:j]] for u,v in zip(query, valid_indices) for i,j in zip(seg_start, seg_end)], dim=0)
-                if self.inference_subject_driven:
+                if self.inference_subject_driven or enhance_tp:
                     key = torch.cat([torch.cat([ torch.cat([u[seg_start[seg]:seg_end[seg]][v[seg_start[seg]:seg_end[seg]]][:144], u[seg_start[seg]:seg_end[seg]][v[seg_start[seg]:seg_end[seg]]][144:] + 0.6 * u[seg_start[seg]:seg_end[seg]][v[seg_start[seg]:seg_end[seg]]][144:].abs().mean()], dim=0) if segs == [0, 1, 2] and seg == 2 else u[seg_start[seg]:seg_end[seg]][v[seg_start[seg]:seg_end[seg]]] for seg in segs], dim=0) \
                                         for u,v in zip(key, valid_indices) for segs in k_segs], dim=0)
                 else:
@@ -756,6 +758,7 @@ class HunyuanVideoTokenReplaceSingleTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         token_replace_emb: torch.Tensor = None,
         num_tokens: int = None,
+        enhance_tp: bool = False,
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
@@ -777,6 +780,7 @@ class HunyuanVideoTokenReplaceSingleTransformerBlock(nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=image_rotary_emb,
+            enhance_tp=enhance_tp,
         )
         attn_output = torch.cat([attn_output, context_attn_output], dim=1)
 
@@ -841,6 +845,7 @@ class HunyuanVideoTokenReplaceTransformerBlock(nn.Module):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         token_replace_emb: torch.Tensor = None,
         num_tokens: int = None,
+        enhance_tp: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Input normalization
         (
@@ -864,6 +869,7 @@ class HunyuanVideoTokenReplaceTransformerBlock(nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
+            enhance_tp=enhance_tp,
         )
 
         # 3. Modulation and residual connection
@@ -1109,6 +1115,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         frame_gap: Union[int, None] = None,
+        enhance_tp: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -1181,6 +1188,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
                     image_rotary_emb,
                     token_replace_emb,
                     first_frame_num_tokens,
+                    enhance_tp,
                 )
 
             for block in self.single_transformer_blocks:
@@ -1193,6 +1201,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
                     image_rotary_emb,
                     token_replace_emb,
                     first_frame_num_tokens,
+                    enhance_tp,
                 )
 
         else:
@@ -1205,6 +1214,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
                     image_rotary_emb,
                     token_replace_emb,
                     first_frame_num_tokens,
+                    enhance_tp,
                 )
 
             for block in self.single_transformer_blocks:
@@ -1216,6 +1226,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
                     image_rotary_emb,
                     token_replace_emb,
                     first_frame_num_tokens,
+                    enhance_tp,
                 )
 
         # 5. Output projection

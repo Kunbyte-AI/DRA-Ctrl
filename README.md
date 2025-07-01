@@ -13,10 +13,14 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 [![HuggingFace](https://img.shields.io/badge/🤗-HF%20Space-yellow)](https://huggingface.co/spaces/Kunbyte/DRA-Ctrl)
 [![GitHub](https://img.shields.io/badge/GitHub-Repo-black)](https://github.com/Kunbyte-AI/DRA-Ctrl)
 
+## Updates
+[2025-07-01] Added a new Gradio app (gradio_app_hf.py) designed similarly to our HuggingFace Space, making it easier to switch tasks, adjust parameters, and directly test examples. The previous Gradio app (gradio_app.py) will remain unchanged.
+
 ## ✅ TODOs
 
 - [x] release code
 - [x] release checkpoints
+- [ ] use quantized version to save VRAM
 - [ ] using FramePack as base model
 
 ## 🔍 Introduction
@@ -36,8 +40,9 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 
 ## 🚀 Quick Start
 
-### Hardware Requirement
+### Hardware Requirements
 Our method is implemented on Linux with H800 80GB GPU.
+The peak VRAM consumption stays below 45GB.
 
 ### Dependencies
 ```
@@ -76,6 +81,11 @@ DRA-Ctrl/
 ```
 python gradio_app.py --config configs/gradio.yaml
 ```
+For easier switching between tasks, adjusting parameter, and testing examples, please use
+```
+python gradio_app_hf.py
+```
+
 
 For easier testing, in ​spatially-aligned image generation tasks, when passing the condition image to `gradio_app`, there's no need to manually input edge maps, depth maps, or other condition images - only the original image is required. The corresponding condition images will be automatically extracted.
 
@@ -89,9 +99,11 @@ Examples:
 |            Deblurring           |   ![](assets/deblurring_ci.png)   |                 Vibrant rainbow ball creates dramatic splash in clear water, bubbles swirling against crisp white background                 |                                                               -                                                               |   ![](assets/deblurring_ti.png)   |
 |          Depth to Image         |      ![](assets/depth_ci.png)     |                  Golden-brown cat-shaped bread loaf with closed eyes rests on wooden table, soft kitchen blur in background                  |                                                               -                                                               |      ![](assets/depth_ti.png)     |
 |         Depth Prediction        |   ![](assets/depth_pred_ci.png)   |                 Steaming bowl of ramen with pork slices, soft-boiled egg, greens, and scallions in rich broth on wooden table                |                                                               -                                                               |   ![](assets/depth_pred_ti.png)   |
+|         In/Out-painting         |      ![](assets/fill_2_ci.png)      |                          Her left hand emerges at the frame's lower right, delicately cradling a vibrant red flower against the black void                         |                                                               -                                                               |      ![](assets/fill_2_ti.png)      |
 |         In/Out-painting         |      ![](assets/fill_ci.png)      |                          Mona Lisa dons a medical mask, her enigmatic smile now concealed beneath crisp white fabric                         |                                                               -                                                               |      ![](assets/fill_ti.png)      |
 |         Super-resolution        |       ![](assets/sr_ci.png)       |          Crispy buffalo wings and golden fries rest on a red-and-white checkered paper lining a gleaming metal tray, with creamy dip         |                                                               -                                                               |       ![](assets/sr_ti.png)       |
 | Subject-driven image generation | ![](assets/subject_driven_ci.jpg) |                                                            The woman stands in a snowy forest, captured in a half-portrait outfit                                                            |                                                             Woman in cream knit sweater sits calmly by a crackling fireplace, surrounded by warm candlelight and rustic wooden shelves                                                             | ![](assets/subject_driven_ti.png) |
+| Subject-driven image generation | ![](assets/subject_driven_dreambench_ci.jpg) |                                                            a cat in a chef outfit outfit                                                            |                                                             a cat                                                             | ![](assets/subject_driven_dreambench_ti.png) |
 |          Style Transfer         | ![](assets/style_transfer_ci.jpg) | bitmoji style. An orange cat sits quietly on the stone slab. Beside it are the green grasses. With its ears perked up, it looks to one side. | An orange cat sits quietly on the stone slab. Beside it are the green grasses. With its ears perked up, it looks to one side. | ![](assets/style_transfer_ti.png) |
 
 ## 📋 Citation
