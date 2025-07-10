@@ -1,0 +1,2695 @@
+# ------------------ Memory Management 3.5.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+#
+# This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
+# This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
+# times in a pipe (eg VAE).
+#
+# Requirements:
+# - VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090)
+# - RAM: minimum 24 GB, recommended 48 - 64 GB 
+# 
+# It is almost plug and play and just needs to be invoked from the main app just after the model pipeline has been created.
+# Make sure that the pipeline explictly loads the models in the CPU device 
+#   for instance: pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
+# For a quick setup, you may want to choose between 5 profiles depending on your hardware, for instance:
+#   from mmgp import offload, profile_type
+#   offload.profile(pipe, profile_type.HighRAM_LowVRAM_Fast)
+# Alternatively you may want to your own parameters, for instance:
+#   from mmgp import offload
+#   offload.all(pipe, pinToMemory=true, extraModelsToQuantize = ["text_encoder_2"] )
+# The 'transformer' model that contains usually the video or image generator is quantized on the fly by default to 8 bits so that it can fit into 24 GB of VRAM. 
+# You can prevent the transformer quantization by adding the parameter quantizeTransformer = False
+# If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option quantizeTransformer to False to turn off on the fly quantization.
+# You can specify a list of additional models string ids to quantize (for instance the text_encoder) using the optional argument extraModelsToQuantize. This may be useful if you have less than 48 GB of RAM.
+# Note that there is little advantage on the GPU / VRAM side to quantize text encoders as their inputs are usually quite light. 
+# Conversely if you have more than 48GB RAM you may want to enable RAM pinning with the option pinnedMemory = True. You will get in return super fast loading / unloading of models
+# (this can save significant time if the same pipeline is run multiple times in a row)
+# 
+# Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.
+#
+# For instance :
+# for flux derived models: pipe = { "text_encoder": clip, "text_encoder_2": t5, "transformer": model, "vae":ae }
+# for mochi: pipe = { "text_encoder": self.text_encoder, "transformer": self.dit, "vae":self.decoder }
+#
+# Please note that there should be always one model whose Id is 'transformer'. It corresponds to the main image / video model which usually needs to be quantized (this is done on the fly by default when loading the model)
+# 
+# Becareful, lots of models use the T5 XXL as a text encoder. However, quite often their corresponding pipeline configurations point at the official Google T5 XXL repository 
+# where there is a huge 40GB model to download and load. It is cumbersorme as it is a 32 bits model and contains the decoder part of T5 that is not used. 
+# I suggest you use instead one of the 16 bits encoder only version available around, for instance:
+# text_encoder_2 = T5EncoderModel.from_pretrained("black-forest-labs/FLUX.1-dev", subfolder="text_encoder_2", torch_dtype=torch.float16)
+#
+# Sometime just providing the pipe won't be sufficient as you will need to change the content of the core model: 
+# - For instance you may need to disable an existing CPU offload logic that already exists (such as manual calls to move tensors between cuda and the cpu)
+# - mmpg to tries to fake the device as being "cuda" but sometimes some code won't be fooled and it will create tensors in the cpu device and this may cause some issues.
+# 
+# You are free to use my module for non commercial use as long you give me proper credits. You may contact me on twitter @deepbeepmeep
+#
+# Thanks to
+# ---------
+# Huggingface / accelerate for the hooking examples
+# Huggingface / quanto for their very useful quantizer
+# gau-nernst for his Pinnig RAM samples
+
+
+#
+
+import torch
+import gc
+import time
+import functools
+import sys
+import os
+import json
+import psutil
+import builtins
+from accelerate import init_empty_weights
+
+
+from mmgp import safetensors2
+from mmgp import profile_type
+
+from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
+
+# support for Embedding module quantization that is not supported by default by quanto
+@register_qmodule(torch.nn.Embedding)
+class QEmbedding(QModuleMixin, torch.nn.Embedding):
+    bias = None
+    @classmethod
+    def qcreate(cls, module, weights, activations = None, optimizer = None, device = None):
+        module.bias = None
+        return cls( module.num_embeddings, module.embedding_dim, module.padding_idx , module.max_norm, module.norm_type, module.scale_grad_by_freq, module.sparse, dtype=module.weight.dtype, device=device, weights=weights,
+                    activations=activations, optimizer=optimizer, quantize_input=True)      
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding( input, self.qweight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse )
+
+
+shared_state = {}
+
+mmm = safetensors2.mmm
+
+default_verboseLevel = 1
+
+ONE_MB =  1048576
+sizeofhalffloat = torch.bfloat16.itemsize
+sizeofint8 = torch.int8.itemsize
+total_pinned_bytes = 0
+max_pinnable_bytes = 0
+
+physical_memory= psutil.virtual_memory().total
+
+HEADER = '\033[95m'
+ENDC = '\033[0m'
+BOLD ='\033[1m'
+UNBOLD ='\033[0m'
+
+class clock:
+    def __init__(self):
+        self.start_time = 0
+        self.end_time = 0
+
+    @classmethod
+    def start(cls):
+        self = cls()        
+        self.start_time =time.time()
+        return self        
+
+    def stop(self):
+        self.stop_time =time.time()  
+
+    def time_gap(self):
+        return self.stop_time - self.start_time
+    
+    def format_time_gap(self):
+        return f"{self.stop_time - self.start_time:.2f}s"
+
+
+
+# useful functions to move a group of tensors (to design custom offload patches)
+def move_tensors(obj, device):
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    elif isinstance(obj, dict):
+        _dict = {}
+        for k, v in obj.items():
+            _dict[k] = move_tensors(v, device)
+        return _dict
+    elif isinstance(obj, list):
+        _list = []
+        for v in obj:
+            _list.append(move_tensors(v, device))
+        return _list
+    else:
+        raise TypeError("Tensor or list / dict of tensors expected")
+def _get_module_name(v):
+    return v.__module__.lower()
+
+
+def _compute_verbose_level(level):
+    if level <0:        
+        level = safetensors2.verboseLevel = default_verboseLevel
+    safetensors2.verboseLevel = level
+    return level
+
+def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
+    if perc_reserved_mem_max <=0:
+        perc_reserved_mem_max = os.getenv("perc_reserved_mem_max", 0)
+
+    if perc_reserved_mem_max <= 0:             
+        perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
+    return perc_reserved_mem_max
+    
+def _get_max_reservable_memory(perc_reserved_mem_max = 0):
+    max_reservable_memory = perc_reserved_mem_max * physical_memory
+    return  max_reservable_memory
+
+def _detect_main_towers(model, min_floors = 5):
+    cur_blocks_prefix = None
+    towers_modules= []
+    towers_names= []
+
+    floors_modules= []
+    tower_name = None
+
+
+    for submodule_name, submodule in model.named_modules():  
+
+        if submodule_name=='':
+            continue
+
+        if cur_blocks_prefix != None:
+            if submodule_name.startswith(cur_blocks_prefix):
+                depth_prefix = cur_blocks_prefix.split(".")
+                depth_name = submodule_name.split(".")
+                level  =  depth_name[len(depth_prefix)-1]                        
+                pre , num = _extract_num_from_str(level)
+
+                if num != cur_blocks_seq: 
+                    floors_modules.append(submodule)
+
+                cur_blocks_seq = num
+            else:
+                if len(floors_modules) >= min_floors:
+                    towers_modules += floors_modules
+                    towers_names.append(tower_name)
+                tower_name = None
+                floors_modules= []
+                cur_blocks_prefix, cur_blocks_seq = None, -1
+
+        if cur_blocks_prefix == None:
+            pre , num = _extract_num_from_str(submodule_name)
+            if isinstance(submodule, (torch.nn.ModuleList)):  
+                cur_blocks_prefix, cur_blocks_seq = pre + ".",  -1
+                tower_name = submodule_name + "." 
+            elif num >=0:
+                cur_blocks_prefix, cur_blocks_seq = pre, num
+                tower_name = submodule_name[ :-1]  
+                floors_modules.append(submodule)
+
+    if len(floors_modules) >= min_floors:
+        towers_modules += floors_modules
+        towers_names.append(tower_name)
+
+    return towers_names, towers_modules
+
+
+
+def _get_model(model_path):
+    if os.path.isfile(model_path):
+        return model_path
+    
+    from pathlib import Path
+    _path = Path(model_path).parts
+    _filename = _path[-1]
+    _path = _path[:-1]
+    if len(_path)<=1:
+        raise Exception("file not found")
+    else:
+        try:
+            from huggingface_hub import  hf_hub_download #snapshot_download,    
+            repoId=  os.path.join(*_path[0:2] ).replace("\\", "/")
+
+            if len(_path) > 2:
+                _subfolder = os.path.join(*_path[2:] )
+                model_path = hf_hub_download(repo_id=repoId,  filename=_filename,  subfolder=_subfolder)
+            else:
+                model_path = hf_hub_download(repo_id=repoId,  filename=_filename)
+        except:
+           model_path = None 
+    return model_path
+
+
+
+def _remove_model_wrapper(model):
+    if not model._modules is None:
+        if len(model._modules)!=1:
+            return model
+    sub_module = model._modules[next(iter(model._modules))]
+    if hasattr(sub_module,"config") or hasattr(sub_module,"base_model"):
+        return sub_module
+    return model  
+
+ 
+
+def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
+    dtype= source_tensor.dtype
+    shape = source_tensor.shape
+    if len(shape) == 0:
+        return source_tensor
+    else:                
+        t = source_tensor.view(torch.uint8)
+        t = torch.reshape(t, (length,))
+        # magic swap !
+        big_tensor[offset: offset + length] = t 
+        t = big_tensor[offset: offset + length]
+        t = t.view(dtype)
+        t = torch.reshape(t, shape)
+        assert t.is_pinned()
+    return t
+
+def _safetensors_load_file(file_path, writable_tensors = True):
+    from collections import OrderedDict
+    sd = OrderedDict()    
+
+    with safetensors2.safe_open(file_path, framework="pt", device="cpu", writable_tensors =writable_tensors) as f:
+        for k in f.keys():
+            sd[k] = f.get_tensor(k)
+        metadata = f.metadata()
+
+    return sd, metadata
+
+def _force_load_buffer(p):
+    # To do : check if buffer was persistent and transfer state, or maybe swap keep already this property ?
+    q = torch.nn.Buffer(p + 0)
+    torch.utils.swap_tensors(p, q)
+    del q
+
+def _force_load_parameter(p):
+    q = torch.nn.Parameter(p + 0)
+    torch.utils.swap_tensors(p, q)
+    del q
+
+def _get_tensor_ref(p):
+    if isinstance(p, QTensor):
+        if p._qtype == qint4:
+            return p._data._data.data_ptr()
+        else:
+            return p._data.data_ptr()
+    else:                
+        return p.data_ptr()
+
+
+BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
+BIG_TENSOR_MIN_SIZE = 2**26 # 64 MB
+RESERVED_RAM_MIN_AVAILABLE = BIG_TENSOR_MAX_SIZE # 2**27 # 128 MB
+
+def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
+    tied_weights = {}
+    tied_weights_count = 0
+    tied_weights_total = 0
+    tied_weights_last = None
+    ref_cache = {}
+
+    for n, p in sd.items():
+        ref = _get_tensor_ref(p)
+        match = ref_cache.get(ref, None)
+        if match != None:
+            match_name, match_size = match
+            tied_weights_count += 1
+            tied_weights_total += match_size
+            if verboseLevel >=1:
+                tied_weights_last = f"{match_name} <-> {n}"
+            tied_weights[n] = match_name
+        else:
+            length = torch.numel(p.data) * p.data.element_size() 
+            ref_cache[ref] = (n, length)
+        
+    if verboseLevel >=1 and tied_weights_count > 0:
+        if  tied_weights_count == 1:
+            print(f"Tied weights of {tied_weights_total/ONE_MB:0.2f} MB detected: {tied_weights_last}")
+        else:
+            print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
+
+def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
+    global max_pinnable_bytes, total_pinned_bytes
+
+
+    names_list = sd_name if isinstance(sd, list) else [sd_name]
+
+    if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
+
+        if  verboseLevel>=1 :
+            print(f"Unable pin data of '{','.join(names_list)}' to reserved RAM as there is no reserved RAM left")
+        return
+
+    
+    if isinstance(sd, list):
+        new_sd = {}
+        for i, sub_sd,  in enumerate(sd):
+            for k, v in sub_sd.items():
+                new_sd[str(i) + "#" + k] =v
+        sd = new_sd
+        del new_sd
+        sub_sd = None
+
+    if isinstance(tied_weights, list):
+        new_tied_weights = {}
+        for i, sub_tied_weights,  in enumerate(tied_weights):
+            for k, v in sub_tied_weights.items():
+                new_tied_weights[str(i) + "#" + k] =v
+        sd = new_tied_weights
+        del new_tied_weights
+        sub_tied_weights = None
+
+    current_big_tensor_size = 0
+    big_tensor_no  = 0
+    big_tensors_sizes = []
+    tensor_map_indexes = []
+    total_tensor_bytes = 0
+
+    for n, p in sd.items():
+        if tied_weights == None or not n in tied_weights :
+            length = torch.numel(p.data) * p.data.element_size() 
+
+            if current_big_tensor_size + length > gig_tensor_size :
+                big_tensors_sizes.append(current_big_tensor_size)
+                current_big_tensor_size = 0
+                big_tensor_no += 1
+
+            itemsize = p.data.dtype.itemsize
+            if current_big_tensor_size % itemsize:
+                current_big_tensor_size += itemsize - current_big_tensor_size % itemsize
+            tensor_map_indexes.append((big_tensor_no, current_big_tensor_size, length  ))
+            current_big_tensor_size += length
+
+            total_tensor_bytes += length
+  
+    big_tensors_sizes.append(current_big_tensor_size)
+
+    big_tensors = []
+    last_big_tensor = 0
+    total = 0  
+    incomplete_pinning = False
+
+    try:
+        dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
+    except:
+        print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less 0.3")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return
+    
+    for size in big_tensors_sizes:
+        try:
+            current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
+            big_tensors.append(current_big_tensor)
+        except:
+            incomplete_pinning = True
+            print(f"Unable to pin more tensors for '{sd_name}' as the maximum reservable memory has been reached ({total/ONE_MB:.2f})")
+            break
+
+        last_big_tensor += 1
+        total += size
+    del dummy_pinned_tensor
+
+        
+    tensor_no = 0
+    # prev_big_tensor = 0
+    q_name = None
+    for n, p  in sd.items():
+        if tied_weights != None:
+            q_name = tied_weights.get(n,None)
+        if q_name != None:
+            q = sd[q_name] 
+            p.data = q.data
+            assert p.data.is_pinned()
+            q = None
+        else:
+            big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
+ 
+            if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
+                current_big_tensor = big_tensors[big_tensor_no]
+                length = torch.numel(p.data) * p.data.element_size()
+                q = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
+                torch.utils.swap_tensors(p, q)
+                del q 
+            tensor_no += 1
+        del p
+    # global total_pinned_bytes
+    # total_pinned_bytes += total
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+    if verboseLevel >=1:
+        if incomplete_pinning :
+            if len(names_list) > 0:
+                print(f"'{','.join(names_list)}' were partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+            else:
+                print(f"'{','.join(names_list)}' was partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+        else:
+            if len(names_list) > 0:
+                print(f"'{','.join(names_list)}' were pinned entirely to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+            else:
+                print(f"'{','.join(names_list)}' was pinned entirely to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+
+
+    return 
+
+
+def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1):
+
+    global max_pinnable_bytes, total_pinned_bytes
+    if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
+
+        if  verboseLevel>=1 :
+            print(f"Unable pin data of '{model_id}' to reserved RAM as there is no reserved RAM left")
+        return
+    
+    if partialPinning:
+        towers_names, _ = _detect_main_towers(model)
+
+
+    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max)
+    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max) 
+
+    current_big_tensor_size = 0
+    big_tensor_no  = 0
+    big_tensors_sizes = []
+    tensor_map_indexes = []
+    total_tensor_bytes = 0
+
+    params_dict = {} #  OrderedDict
+    for k, sub_module in model.named_modules():
+        include = True
+        if partialPinning:
+            include = any(k.startswith(pre) for pre in towers_names) if partialPinning else True
+        if include and not pinnedPEFTLora and ".lora_" in k:
+            include = False
+
+        if include:
+            params_dict.update( { k + '.' + n : (p,  False) for n, p in sub_module.named_parameters(recurse=False) }  )
+            params_dict.update( { k + '.' + n : (b,  True) for n, b in sub_module.named_buffers(recurse=False) }  )
+
+    if  verboseLevel>=1 :
+        if partialPinning:
+            if len(params_dict) == 0:
+                print(f"Unable to apply Partial of '{model_id}' as no isolated main structures were found")
+            else:
+                print(f"Partial pinning of data of '{model_id}' to reserved RAM")
+        else:            
+            print(f"Pinning data of '{model_id}' to reserved RAM")
+
+    if partialPinning and len(params_dict) == 0:
+        return
+
+    ref_cache = {}
+    tied_weights = {}
+    tied_weights_count = 0
+    tied_weights_total = 0
+    tied_weights_last = None
+
+    for n, (p, _) in params_dict.items():
+        ref = _get_tensor_ref(p)
+        match = ref_cache.get(ref, None)
+        if match != None:
+            match_name, match_size = match
+            tied_weights_count += 1
+            tied_weights_total += match_size
+            if verboseLevel >=1:
+                tied_weights_last = f"{match_name} <-> {n}"
+            tied_weights[n] = match_name
+        else:
+            if isinstance(p, QTensor):
+                if p._qtype == qint4:
+                    if hasattr(p,"_scale_shift"):
+                        length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale_shift) * p._scale_shift.element_size() 
+                    else:
+                        length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale) * p._scale.element_size() + torch.numel(p._shift) * p._shift.element_size()                     
+                else:
+                    length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
+            else:
+                length = torch.numel(p.data) * p.data.element_size() 
+
+            ref_cache[ref] = (n, length)
+            if current_big_tensor_size + length > big_tensor_size and current_big_tensor_size !=0  :
+                big_tensors_sizes.append(current_big_tensor_size)
+                current_big_tensor_size = 0
+                big_tensor_no += 1
+
+
+            itemsize = p.data.dtype.itemsize
+            if current_big_tensor_size % itemsize:
+                current_big_tensor_size += itemsize - current_big_tensor_size % itemsize
+            tensor_map_indexes.append((big_tensor_no, current_big_tensor_size, length  ))
+            current_big_tensor_size += length
+
+            total_tensor_bytes += length
+  
+    if verboseLevel >=1 and tied_weights_count > 0:
+        if  tied_weights_count == 1:
+            print(f"Tied weights of {tied_weights_total/ONE_MB:0.2f} MB detected: {tied_weights_last}")
+        else:
+            print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
+                
+
+    big_tensors_sizes.append(current_big_tensor_size)
+
+    big_tensors = []
+    total = 0
+    
+
+    failed_planned_allocation = False
+    gc.collect()
+    try:
+        dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
+    except:
+        print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less than{perc_reserved_mem_max}")
+        return
+
+    last_allocated_big_tensor = -1        
+    tensor_no = 0
+    # prev_big_tensor = 0
+    for n, (p, is_buffer) in params_dict.items():
+        q_name = tied_weights.get(n,None)
+        if q_name != None:
+            q , _ = params_dict[q_name] 
+            if isinstance(p, QTensor):
+                if p._qtype == qint4:                
+                    p._data._data = q._data._data
+                    p._scale_shift = q._scale_shift
+                    assert p._data._data.data.is_pinned()
+                else:
+                    p._data = q._data
+                    p._scale = q._scale
+                    assert p._data.is_pinned()
+            else:
+                p.data = q.data
+                assert p.data.is_pinned()
+            q = None
+        else:
+
+            big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
+            if last_allocated_big_tensor <  big_tensor_no:
+                last_allocated_big_tensor += 1
+                size = max(big_tensors_sizes[last_allocated_big_tensor], BIG_TENSOR_MIN_SIZE) 
+                try:
+                    if max_reservable_memory > 0 and ( (total_pinned_bytes + total + size) >= max_reservable_memory):
+                        dummy_pinned_tensor = None
+                        failed_planned_allocation = True
+                        max_pinnable_bytes = total_pinned_bytes + total
+                        break
+
+                    current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
+                    big_tensors.append(current_big_tensor)
+                except:
+                    print(f"Unable to pin more tensors for this model as the maximum reservable memory has been reached ({total/ONE_MB:.2f}).")
+                    dummy_pinned_tensor = None
+                    failed_planned_allocation = True
+                    max_pinnable_bytes = total_pinned_bytes + total
+                    break
+
+                total += size
+
+            current_big_tensor = big_tensors[big_tensor_no]
+            if is_buffer :
+                _force_load_buffer(p) # otherwise potential memory leak
+            if isinstance(p, QTensor):
+                if p._qtype == qint4:
+                    length1 = torch.numel(p._data._data) * p._data._data.element_size()
+                    p._data._data =  _move_to_pinned_tensor(p._data._data, current_big_tensor, offset, length1)
+                    if hasattr(p,"_scale_shift"):
+                        length2 = torch.numel(p._scale_shift) * p._scale_shift.element_size() 
+                        p._scale_shift = _move_to_pinned_tensor(p._scale_shift, current_big_tensor, offset + length1, length2)
+                    else:
+                        length2 = torch.numel(p._scale) * p._scale.element_size() 
+                        p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+                        length3 = torch.numel(p._shift) * p._shift.element_size() 
+                        p._shift = _move_to_pinned_tensor(p._shift, current_big_tensor, offset + length1 + length2, length3)
+                else:
+                    length1 = torch.numel(p._data) * p._data.element_size() 
+                    p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
+                    length2 = torch.numel(p._scale) * p._scale.element_size() 
+                    p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+            else:
+                length = torch.numel(p.data) * p.data.element_size() 
+                p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
+            tensor_no += 1
+        del p
+    del dummy_pinned_tensor
+    model._pinned_bytes = total
+    total_pinned_bytes += total
+    del params_dict
+    gc.collect()
+
+    if verboseLevel >=1:
+        if partialPinning or failed_planned_allocation:        
+            print(f"The model was partially pinned to reserved RAM: {last_allocated_big_tensor + 1} large blocks spread across {total/ONE_MB:.2f} MB")
+        else:
+            print(f"The whole model was pinned to reserved RAM: {last_allocated_big_tensor + 1} large blocks spread across {total/ONE_MB:.2f} MB")
+
+    model._already_pinned = True
+
+
+    return 
+welcome_displayed = False
+
+def _welcome():
+    global welcome_displayed
+    if welcome_displayed:
+         return 
+    welcome_displayed = True
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+
+def change_dtype(model, new_dtype, exclude_buffers = False):
+    for submodule_name, submodule in model.named_modules():  
+        if hasattr(submodule, "_lock_dtype"):
+            continue
+        for n, p in submodule.named_parameters(recurse = False):
+            if p.data.dtype != new_dtype:
+                p.data = p.data.to(new_dtype)
+
+        if not exclude_buffers:
+            for p in submodule.buffers(recurse=False):
+                if p.data.dtype != new_dtype:
+                    p.data = p.data.to(new_dtype)
+
+    return model
+            
+def _extract_num_from_str(num_in_str):
+    size = len(num_in_str)
+    for i in range(size):
+        if not num_in_str[-i-1:].isnumeric():
+            if i == 0:
+                return num_in_str, -1
+            else:             
+                return num_in_str[: -i],  int(num_in_str[-i:])                    
+    return  "", -1 if size == 0 else int(num_in_str)
+
+def  _quantize_dirty_hack(model):
+    # dirty hack: add a hook on state_dict() to return a fake non quantized state_dict if called by Lora Diffusers initialization functions
+    setattr( model, "_real_state_dict", model.state_dict)
+    from collections import OrderedDict
+    import traceback
+
+    def state_dict_for_lora(self):
+        real_sd = self._real_state_dict()
+        fakeit = False
+        stack = traceback.extract_stack(f=None, limit=5)
+        for frame in stack:
+            if "_lora_" in frame.name:
+                fakeit = True
+                break
+
+        if not fakeit:
+            return real_sd
+        sd = OrderedDict()
+        for k in real_sd:
+            v = real_sd[k]
+            if k.endswith("._data"):
+                k = k[:len(k)-6]
+            sd[k] = v
+        return sd
+
+    setattr(model, "state_dict", functools.update_wrapper(functools.partial(state_dict_for_lora, model), model.state_dict) )
+
+def _quantization_map(model):
+    from optimum.quanto import quantization_map
+    return quantization_map(model)
+
+def _set_module_by_name(parent_module, name, child_module):
+    module_names = name.split(".")
+    if len(module_names) == 1:
+        setattr(parent_module, name, child_module)
+    else:
+        parent_module_name = name[: name.rindex(".")]
+        parent_module = parent_module.get_submodule(parent_module_name)
+        setattr(parent_module, module_names[-1], child_module)
+
+def _quantize_submodule(
+    model: torch.nn.Module,
+    name: str,
+    module: torch.nn.Module,
+    weights = None,
+    activations = None,
+    optimizer = None,
+):
+    
+    qmodule = quantize_module(module, weights=weights, activations=activations, optimizer=optimizer)
+    if qmodule is not None:
+        _set_module_by_name(model, name, qmodule)
+        qmodule.name = name
+        for name, param in module.named_parameters():
+            # Save device memory by clearing parameters
+            setattr(module, name, None)
+            del param
+
+def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict):
+    # change dtype of current meta model parameters because 'requantize' won't update the dtype on non quantized parameters
+    for k, p in model.named_parameters():
+        if not k in quantization_map and k in state_dict:
+            p_in_file = state_dict[k] 
+            if p.data.dtype != p_in_file.data.dtype:
+                p.data = p.data.to(p_in_file.data.dtype)
+
+    # rebuild quanto objects
+    for name, m in model.named_modules():
+        qconfig = quantization_map.get(name, None)
+        if qconfig is not None:
+            weights = qconfig["weights"]
+            if weights == "none":
+                weights = None
+            activations = qconfig["activations"]
+            if activations == "none":
+                activations = None
+            _quantize_submodule(model, name, m, weights=weights, activations=activations)
+
+    model._quanto_map = quantization_map
+
+    _quantize_dirty_hack(model)
+
+
+
+def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2**31, model_id = 'Unknown'):
+    
+    total_size =0
+    total_excluded = 0
+    exclude_list = []
+    submodule_size = 0
+    submodule_names = []
+    cur_blocks_prefix = None
+    prev_blocks_prefix = None
+
+    # exclude lora weights
+    exclude_list.append("*lora*")
+
+    if hasattr(model_to_quantize, "_quanto_map"):
+        for k, entry in model_to_quantize._quanto_map.items():
+            weights  =  entry["weights"]
+            print(f"Model '{model_id}' is already quantized to format '{weights}'")
+            return False
+        print(f"Model '{model_id}' is already quantized")
+        return False
+
+    print(f"Quantization of model '{model_id}' started to format '{weights}'")
+
+    tower_names ,_  = _detect_main_towers(model_to_quantize)
+    tower_names = [ n[:-1] for n in tower_names]
+
+
+    cache_ref = {}
+    tied_weights= {}
+
+    for submodule_name, submodule in model_to_quantize.named_modules():  
+        if isinstance(submodule, QModuleMixin):
+            if verboseLevel>=1:
+                print("No quantization to do as model is already quantized")
+            return False
+
+        size = 0
+        for n, p in submodule.named_parameters(recurse = False):
+            ref = _get_tensor_ref(p)
+            match = cache_ref.get(ref, None)
+            if match != None:
+                tied_weights[submodule_name]=  (n, ) + match 
+            else:
+                cache_ref[ref] = (submodule_name, n)
+                size  += torch.numel(p.data) * sizeofhalffloat
+
+        for p in submodule.buffers(recurse=False):
+            size  += torch.numel(p.data) * sizeofhalffloat
+
+        already_added = False
+        if hasattr(submodule, "_lock_dtype"):
+            submodule_size += size
+            submodule_names.append(submodule_name)
+            already_added = True
+
+        if not any(submodule_name.startswith(pre) for pre in tower_names):
+            flush = False
+            if cur_blocks_prefix == None or not submodule_name.startswith(cur_blocks_prefix):
+                cur_blocks_prefix = submodule_name + "."
+                flush = True                    
+
+            if flush :
+                if submodule_size <= threshold :
+                    exclude_list += submodule_names
+                    if verboseLevel >=2 and submodule_size >0:
+                        print(f"Excluded size {submodule_size/ONE_MB:.1f} MB: {prev_blocks_prefix} : {submodule_names}")
+                    total_excluded += submodule_size
+
+                submodule_size = 0
+                submodule_names = []
+            prev_blocks_prefix = cur_blocks_prefix
+            if not already_added:
+                submodule_size += size
+                submodule_names.append(submodule_name)
+        total_size += size
+
+    if submodule_size >0  : 
+        exclude_list += submodule_names
+        if verboseLevel >=2:
+            print(f"Excluded size {submodule_size/ONE_MB:.1f} MB: {prev_blocks_prefix} : {submodule_names}")
+        total_excluded += submodule_size
+
+
+    perc_excluded =total_excluded/ total_size if total_size >0 else 1
+    if verboseLevel >=2:
+        if total_excluded == 0:
+            print(f"Can't find any module to exclude from quantization, full model ({total_size/ONE_MB:.1f} MB) will be quantized")
+        else:
+            print(f"Total Excluded {total_excluded/ONE_MB:.1f} MB of {total_size/ONE_MB:.1f} that is {perc_excluded*100:.2f}%")
+    if perc_excluded >= 0.20:
+        if verboseLevel >=2:
+            print(f"Too many modules are excluded, there is something wrong with the selection, switch back to full quantization.")
+        exclude_list = None
+
+
+    exclude_list += list(tied_weights) 
+    quantize(model_to_quantize, weights= weights, exclude= exclude_list)
+
+
+    # quantize(model_to_quantize,weights, include= [ "*1.block.attn.to_out*"]) #" 
+
+    # for name, m in model_to_quantize.named_modules():
+    #     if exclude_list is None or not any( name == module_name for module_name in exclude_list):
+    #         _quantize_submodule(model_to_quantize, name, m, weights=weights, activations=None, optimizer=None)
+
+
+    # force to read non quantized parameters so that their lazy tensors and corresponding mmap are released
+    # otherwise we may end up keeping in memory both the quantized and the non quantize model
+    named_modules = {n:m for n,m in model_to_quantize.named_modules()}
+    for module_name, module in named_modules.items():
+        # do not read quantized weights (detected them directly or behind an adapter)
+        if isinstance(module, QModuleMixin) or hasattr(module, "base_layer") and  isinstance(module.base_layer, QModuleMixin): 
+            if hasattr(module, "bias") and module.bias is not None:
+                _force_load_parameter(module.bias)
+        else:
+            tied_w = tied_weights.get(module_name, None)
+            for n, p in module.named_parameters(recurse = False):
+                if tied_w != None and n == tied_w[0]:
+                    if isinstance( named_modules[tied_w[1]], QModuleMixin) :
+                        setattr(module, n, None) # release refs of tied weights if source is going to be quantized
+                    # otherwise don't force load as it will be loaded in the source anyway
+                else:
+                    _force_load_parameter(p)
+                del p #  del p if not it will still contain a ref to a tensor when leaving the loop
+        for b in module.buffers(recurse = False):
+            _force_load_buffer(b) 
+            del b
+
+
+    freeze(model_to_quantize)
+    torch.cuda.empty_cache()
+    gc.collect()       
+
+    for tied_module, (tied_weight, src_module, src_weight) in tied_weights.items():  
+        p = getattr(named_modules[src_module], src_weight)
+        if isinstance(p, QTensor):
+            setattr(named_modules[tied_module], tied_weight, p ) # copy refs to quantized sources
+
+    del named_modules
+
+    quantization_map = _quantization_map(model_to_quantize)
+
+    model_to_quantize._quanto_map = quantization_map
+
+    if hasattr(model_to_quantize, "_already_pinned"):
+        delattr(model_to_quantize, "_already_pinned")
+
+    _quantize_dirty_hack(model_to_quantize)
+
+    print(f"Quantization of model '{model_id}' done")
+
+    return True
+
+def split_linear_modules(model, map ):
+    from optimum.quanto import QModuleMixin, WeightQBytesTensor, QLinear
+    from accelerate import init_empty_weights
+
+    modules_dict = { k: m for k, m in model.named_modules()}
+    for module_suffix, split_info in map.items():
+        mapped_modules = split_info["mapped_modules"]
+        split_sizes = split_info["split_sizes"]
+        for k, module in modules_dict.items():
+            if k.endswith("." + module_suffix):
+                parent_module = modules_dict[k[:len(k)-len(module_suffix)-1]]
+                weight = module.weight
+                bias = getattr(module, "bias", None) 
+                if isinstance(module, QModuleMixin):
+                    _data = weight._data
+                    _scale = weight._scale
+                    sub_data = torch.split(_data, split_sizes, dim=0)
+                    sub_scale = torch.split(_scale, split_sizes, dim=0)
+                    sub_bias = torch.split(bias, split_sizes, dim=0)
+                    for sub_name, _subdata, _subbias, _subscale in zip(mapped_modules, sub_data, sub_bias, sub_scale):
+                        with init_empty_weights():
+                            sub_module = QLinear(_subdata.shape[1], _subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
+                        sub_module.weight = torch.nn.Parameter(WeightQBytesTensor.create(weight.qtype, weight.axis, _subdata.size(), weight.stride(), _subdata, _subscale, activation_qtype=weight.activation_qtype, requires_grad=weight.requires_grad ))
+                        if bias != None:                        
+                            sub_module.bias = torch.nn.Parameter(_subbias)
+                        sub_module.optimizer = module.optimizer
+                        sub_module.weight_qtype = module.weight_qtype
+                        setattr(parent_module, sub_name, sub_module)
+                    # del _data, _scale, _subdata, sub_d                
+                else:
+                    sub_data = torch.split(weight, split_sizes, dim=0)
+                    sub_bias = torch.split(bias, split_sizes, dim=0)
+                    for sub_name, subdata, subbias in zip(mapped_modules, sub_data, sub_bias):
+                        with init_empty_weights():
+                            sub_module = torch.nn.Linear( subdata.shape[1], subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
+                        sub_module.weight = torch.nn.Parameter(subdata , requires_grad=False)
+                        if bias != None:
+                            sub_module.bias = torch.nn.Parameter(subbias)
+                        setattr(parent_module, sub_name, sub_module)
+
+                delattr(parent_module, module_suffix)
+
+
+def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    loras_model_data = getattr(model, "_loras_model_data", None)
+    if loras_model_data == None:
+        raise Exception(f"No Loras has been declared for this model while creating the corresponding offload object")
+    
+    if not check_only:
+        unload_loras_from_model(model)
+
+    modules_dict = {k: v for k,v in model.named_modules()}
+
+    CrLf = '\r\n'
+    error_msg = ""
+    def append(source, text ):
+        if len(source) == 0:
+            return text
+        else:
+            return source + CrLf + text
+    
+    def trunc(text, sz):
+        text = str(text)
+        if len(text) < sz:
+            return text
+        else:
+            return text[0:sz] + '...'
+
+    if not isinstance(lora_path, list):
+        lora_path = [lora_path]
+    
+    if lora_multi is None:
+        lora_multi = [1. for _ in lora_path]
+    loras_nos = []
+    loras_multi = []
+    new_lora_path = []
+    errors  = []
+    adapters = {}
+    adapter_no = 0
+    pinned_sd_list = []
+    pinned_names_list = []
+    for i, path in enumerate(lora_path):
+        adapter_name = str(adapter_no)
+        error_msg = ""
+        if not os.path.isfile(path):
+            error_msg = f"Lora '{path}' was not found"
+            errors.append((path, error_msg))
+            print(error_msg)
+            continue
+        fail = False
+        skip = False
+        state_dict = safetensors2.torch_load_file(path, writable_tensors= False)
+
+        if preprocess_sd != None:
+            state_dict = preprocess_sd(state_dict)
+
+        if split_linear_modules_map != None:
+            new_state_dict = dict()
+            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False)]
+            for module_name, module_data in state_dict.items():
+                name_parts = module_name.split(".")
+                for suffix, pos, any_split in suffixes: 
+                    if module_name.endswith(suffix) and (map := split_linear_modules_map.get(name_parts[pos], None )) != None:
+                        parent_module_name, module_name = ".".join(name_parts[:pos]), None
+                        sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else [None] * len(map["mapped_modules"])  
+                        for sub_name, subdata in zip(map["mapped_modules"], sub_data):
+                            new_module_name = parent_module_name + "." + sub_name + suffix
+                            new_state_dict[new_module_name] = subdata if any_split else module_data
+                        break
+                if module_name != None: new_state_dict[module_name] = module_data            
+            state_dict = new_state_dict
+            del new_state_dict
+            # tied_weights = _extract_tie_weights_from_sd(state_dict, path) # to do
+
+        clean_up = False
+        first_key = next(iter(state_dict), None)
+        if first_key == None:
+            msg = f"Empty Lora '{path}'"
+            error_msg = append(error_msg, msg) 
+            fail = True
+
+        if not fail:
+            pos = first_key.find(".")
+            prefix = first_key[0:pos]
+            if prefix not in ["diffusion_model", "transformer"]:
+                msg = f"No compatible weight was found in Lora file '{path}'. Please check that it is compatible with the Diffusers format."
+                error_msg = append(error_msg, msg) 
+                fail = True
+
+        if not fail:
+
+            state_dict = { k[ len(prefix) + 1:]: v for k, v in state_dict.items() if k.startswith(prefix) }
+            clean_up = True
+
+            keys = list(state_dict.keys())
+
+            lora_alphas = {}
+            for k in keys:
+                if "alpha" in k:
+                    alpha_value = state_dict.pop(k)
+                    if torch.is_tensor(alpha_value):
+                        alpha_value = float(alpha_value.item())
+                    lora_alphas[k] = alpha_value
+
+            invalid_keys = []
+            unexpected_keys = []
+            for k, v in state_dict.items():
+                lora_A = None
+                lora_B = None
+                diff_b = None
+                diff = None
+                if k.endswith(".diff"):
+                    diff = v
+                    module_name = k[ : -5]
+                elif k.endswith(".diff_b"):
+                    diff_b = v
+                    module_name = k[ : -7]
+                else:
+                    pos = k.rfind(".lora_")
+                    if pos <=0:
+                        invalid_keys.append(k)
+                        continue
+                    module_name = k[ : pos]
+                    lora_key = k[ pos+1:]
+                    if lora_key in ("lora_A.weight", "lora_down.weight"):
+                        lora_A = v
+                    elif lora_key in ("lora_B.weight", "lora_up.weight"):
+                        lora_B = v
+                    else:
+                        invalid_keys.append(k)
+                        continue
+
+                module =  modules_dict.get(module_name, None)
+                if module == None:
+                    unexpected_keys.append(k)
+                    continue
+                if False: #not isinstance(module, (QLinear, torch.nn.Linear, torch.nn.Conv3d, torch.nn.LayerNorm)):
+                    msg = f"Lora '{path}' contains a non supported type of layer '{k}'"
+                    error_msg = append(error_msg, msg) 
+                    fail = True
+                    break
+                module_shape = module.weight.shape
+                rank = None
+                if lora_A != None:
+                    rank = lora_A.shape[0] 
+                    if module_shape[1] != v.shape[1]:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}': Lora A dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[1]}, lora A = {v.shape[1]}). It is likely this Lora has been made for another version of this model."
+                            error_msg = append(error_msg, msg) 
+                            fail = True
+                        break
+                elif lora_B != None:
+                    rank = lora_B.shape[1] 
+                    if module_shape[0] != v.shape[0]:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}': Lora B dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora B = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
+                            error_msg = append(error_msg, msg) 
+                            fail = True
+                        break
+                elif diff != None:
+                    lora_B = diff
+                    if module_shape != v.shape:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}': Lora shape is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
+                            error_msg = append(error_msg, msg) 
+                            fail = True
+                        break
+                elif diff_b != None:
+                    rank = diff_b.shape[0] 
+                    if module.bias == None:
+                        msg = f"Lora '{path}': Lora Basis is defined while it doesnt exist in model '{_get_module_name(model)}'. It is likely this Lora has been made for another version of this model."
+                        fail = True
+                        break
+                    else:
+                        module_shape = module.bias.shape
+                        if module_shape != v.shape:
+                            if ignore_model_variations:
+                                skip = True
+                            else:
+                                msg = f"Lora '{path}': Lora Basis dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora Basis = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
+                                error_msg = append(error_msg, msg) 
+                                fail = True
+                            break
+                
+                if not check_only:
+                    loras_module_data = loras_model_data.get(module, None)
+                    assert loras_module_data != None
+                    loras_adapter_data =  loras_module_data.get(adapter_name, None)
+                    if loras_adapter_data == None:
+                        loras_adapter_data = [None, None, None, 1.]
+                        loras_module_data[adapter_name] = loras_adapter_data
+                    if lora_A != None:
+                        loras_adapter_data[0] = lora_A.to(module.weight.dtype) 
+                    elif lora_B != None:
+                        loras_adapter_data[1] = lora_B.to(module.weight.dtype) 
+                    else:
+                        loras_adapter_data[2] = diff_b.to(module.weight.dtype) 
+                    if rank != None:
+                        alpha_key = k[:-len("lora_X.weight")] + "alpha"
+                        alpha = lora_alphas.get(alpha_key, None)
+                        alpha = 1. if alpha == None else alpha / rank  
+                        loras_adapter_data[3] = alpha
+            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = None
+
+            if len(invalid_keys)  > 0:
+                msg = f"Lora '{path}' contains non Lora keys '{trunc(invalid_keys,200)}'"
+                error_msg = append(error_msg, msg) 
+                fail = True
+            if len(unexpected_keys)  > 0:
+                msg = f"Lora '{path}' contains unexpected module keys, it is likely that this Lora is for a different model : '{trunc(unexpected_keys,200)}'"
+                error_msg = append(error_msg, msg) 
+                fail = True
+        if fail or skip:
+            if fail:
+                errors.append((path, error_msg))
+                print(error_msg)
+            if clean_up and not check_only:
+                for m,loras_module_data in loras_model_data.items():
+                    if adapter_name in loras_module_data:
+                        del loras_module_data[adapter_name]
+
+        else:
+            if not check_only:
+                # model._loras_tied_weights[adapter_name] = tied_weights
+                if pinnedLora:
+                    pinned_sd_list.append(state_dict)
+                    pinned_names_list.append(path)
+                    # _pin_sd_to_memory(state_dict, path)
+
+            del state_dict 
+
+
+            adapters[adapter_name] = path
+            loras_nos.append(adapter_name)
+            new_lora_path.append(path)        
+            loras_multi.append(1.0 if i > (len(lora_multi) -1) else lora_multi[i])
+            pass
+            adapter_no += 1
+            if verboseLevel >=1:
+                if check_only:
+                    print(f"Lora '{path}' was found for model '{_get_module_name(model)}'")
+                else:
+                    print(f"Lora '{path}' was loaded in model '{_get_module_name(model)}'")
+    
+    model._loras_errors = errors
+    if not check_only:
+        if pinnedLora and len(pinned_sd_list) > 0:
+            _pin_sd_to_memory(pinned_sd_list, pinned_names_list)
+        model._loras_adapters = adapters
+    if activate_all_loras:
+        activate_loras(model, loras_nos, loras_multi)
+    return new_lora_path
+
+def unload_loras_from_model(model):
+    for _, v in model._loras_model_data.items():
+        v.clear()
+
+    model._loras_active_adapters = []
+    model._loras_scaling = dict()
+    model._loras_tied_weights = dict()
+    model._loras_errors = None
+    model._loras_adapters = None
+    model._loras_scaling = None
+
+
+def set_step_no_for_lora(model, step_no):
+    model._lora_step_no = step_no
+
+def activate_loras(model, lora_nos, lora_multi = None):
+    if not isinstance(lora_nos, list):
+        lora_nos = [lora_nos]
+    lora_nos = [str(l) for l in lora_nos]
+
+    if lora_multi is None:
+        lora_multi = [1. for _ in lora_nos]
+
+    lora_scaling_dict = {}
+    for no, multi in zip(lora_nos, lora_multi):
+        lora_scaling_dict[no] = multi
+
+    model._lora_step_no = 0    
+    model._loras_active_adapters = lora_nos
+    model._loras_scaling = lora_scaling_dict 
+
+
+def move_loras_to_device(model, device="cpu" ):
+    if hasattr( model, "_lora_loadable_modules"):
+        for k in model._lora_loadable_modules:
+            move_loras_to_device(getattr(model,k), device)
+        return
+    
+    for k, m in model.named_modules():
+        if ".lora_" in k:
+            m.to(device)
+
+def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, configKwargs ={}):
+    """
+    quick version of .LoadfromPretrained of  the transformers library
+    used to build a model and load the corresponding weights (quantized or not)
+    """       
+
+    
+    import os.path
+    if not isinstance(model_path, list):
+        model_path = [model_path]
+
+
+    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") for file_name in model_path):
+        raise Exception("full model path to file expected")
+
+    model_path = [ _get_model(file) for file in model_path] 
+    if any( file == None for file in model_path):
+        raise Exception("Unable to find file")
+    
+    verboseLevel = _compute_verbose_level(verboseLevel)
+    if model_path[-1].endswith(".pt"):
+        metadata = None
+    else:
+        with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
+            metadata = f.metadata() 
+
+    if metadata is None:
+        transformer_config = None
+    else:
+        transformer_config = metadata.get("config", None)
+
+    if transformer_config == None or forcedConfigPath != None:
+        if forcedConfigPath != None:
+            config_fullpath = forcedConfigPath
+        else:
+            config_fullpath =  os.path.join(os.path.dirname(model_path[-1]), "config.json") if defaultConfigPath == None else defaultConfigPath
+
+        if not os.path.isfile(config_fullpath):
+            raise Exception("a 'config.json' that describes the model is required in the directory of the model or inside the safetensor file")
+
+        with open(config_fullpath, "r", encoding="utf-8") as reader:
+            text = reader.read()
+        transformer_config= json.loads(text)
+
+    transformer_config.update( configKwargs )
+
+    if "architectures" in transformer_config: 
+        architectures = transformer_config["architectures"]
+        class_name = architectures[0] 
+        if modelClass !=None:
+            transfomer_class = modelClass
+        else:
+            module = __import__("transformers")
+            map = {  "T5WithLMHeadModel" : "T5EncoderModel"}
+            class_name = map.get(class_name, class_name)
+            transfomer_class = getattr(module, class_name)
+        from transformers import AutoConfig
+
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete = False,  encoding ="utf-8") as fp: 
+            fp.write(json.dumps(transformer_config))
+            fp.close()
+            config_obj = AutoConfig.from_pretrained(fp.name)     
+        os.remove(fp.name)
+        #needed to keep inits of non persistent buffers
+        with init_empty_weights():
+            model = transfomer_class(config_obj)
+                
+
+    elif "_class_name" in transformer_config:
+        class_name = transformer_config["_class_name"]
+
+        if modelClass !=None:
+            transfomer_class = modelClass
+        else:
+            module = __import__("diffusers")
+            transfomer_class = getattr(module, class_name)
+
+        with init_empty_weights():
+            model = transfomer_class.from_config(transformer_config )
+
+
+    torch.set_default_device('cpu')
+
+    model._config = transformer_config
+            
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors ,verboseLevel=verboseLevel )
+
+    return model
+
+
+
+def load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  verboseLevel = -1):
+    """
+    Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
+    """
+    if not isinstance(file_path, list):
+        file_path = [file_path]
+
+    file_path = [ _get_model(file) for file in file_path] 
+    if any( file == None for file in file_path):
+        raise Exception("Unable to find file")
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    model = _remove_model_wrapper(model)
+
+    def filter_state_dict(state_dict, base_model_prefix):
+        new_state_dict= {}
+        start = -1
+        for k,v in state_dict.items():
+            if k.startswith(base_model_prefix):
+
+                new_start = len(base_model_prefix)
+            else:
+                pos = k.find("." + base_model_prefix)
+                if pos < 0:
+                    continue
+                new_start = pos + len(base_model_prefix)  +1
+            if start != -1 and start != new_start:
+                new_state_dict  = state_dict
+                break
+            start = new_start  
+            new_state_dict[k[ start:]] = v
+        return new_state_dict
+
+    full_quantization_map = {}
+    full_tied_weights_map = {}
+    full_state_dict = {}
+    for file in file_path:
+        quantization_map = None
+        tied_weights_map = None
+        if not (".safetensors" in file or ".sft" in file): 
+            if pinToMemory:
+                raise Exception("Pinning to memory while loading only supported for safe tensors files")
+            state_dict = torch.load(file, weights_only=True, map_location="cpu")
+            if "module" in state_dict:
+                state_dict = state_dict["module"]
+            
+        else:
+            basename = os.path.basename(file)
+
+            if "-of-" in basename:
+                metadata = None
+                file_parts= basename.split("-")
+                parts_max = int(file_parts[-1][:5])
+                state_dict = {}
+                for i in range(1, parts_max + 1):
+                    file_parts[1] = ("0000" + str(i))[:5]
+                    sd, _ = _safetensors_load_file( os.path.join( os.path.dirname(file), "-".join(file_parts) ) , writable_tensors =writable_tensors)
+                    state_dict.update(sd)
+            else:
+                state_dict, metadata = _safetensors_load_file(file, writable_tensors =writable_tensors)
+                
+            if metadata !=  None:
+                quantization_map = metadata.get("quantization_map", None)
+                config = metadata.get("config", None)
+                if config is not None:
+                    model._config = config
+
+                tied_weights_map = metadata.get("tied_weights_map", None)
+                if tied_weights_map != None:
+                    for name, tied_weights_list in tied_weights_map.items():
+                        mapped_weight = state_dict[name]
+                        for tied_weights in tied_weights_list:
+                            state_dict[tied_weights] = mapped_weight
+
+            if quantization_map is None:
+                pos = str.rfind(file, ".")
+                if pos > 0:
+                    quantization_map_path = file[:pos]
+                quantization_map_path += "_map.json"
+
+                if os.path.isfile(quantization_map_path):
+                    with open(quantization_map_path, 'r') as f:
+                        quantization_map = json.load(f)
+        
+        full_state_dict.update(state_dict)
+        if quantization_map != None:
+            full_quantization_map.update(quantization_map)
+        if tied_weights_map != None:
+            full_tied_weights_map.update(tied_weights_map)
+
+    state_dict, quantization_map, tied_weights_map  = full_state_dict, full_quantization_map, full_tied_weights_map
+    full_state_dict, full_quantization_map, full_tied_weights_map = None, None, None
+
+    # deal if we are trying to load just a sub part of a larger model
+    if modelPrefix != None:
+        base_model_prefix = modelPrefix + "."
+        state_dict = filter_state_dict(state_dict,base_model_prefix)
+        if quantization_map != None:
+            quantization_map = filter_state_dict(quantization_map,base_model_prefix)
+
+    if len(quantization_map) == 0:
+        if any("quanto" in file for file in file_path) and not do_quantize:
+            print("Model seems to be quantized by quanto but no quantization map was found whether inside the model or in a separate '{file_path[:json]}_map.json' file")
+    else:
+        _requantize(model, state_dict, quantization_map)    
+
+
+
+    missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
+    if len(missing_keys) > 0 :
+        # if there is a key mismatch maybe we forgot to remove some prefix
+        base_model_prefix = None
+        for k,v in state_dict.items():
+            if k.endswith(missing_keys[0]):
+                base_model_prefix = k[:-len(missing_keys[0])]
+                break
+        if base_model_prefix == None:
+            raise Exception(f"Missing keys: {missing_keys}")
+        state_dict = filter_state_dict(state_dict, base_model_prefix)
+        missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
+    del state_dict
+    if len(unexpected_keys) > 0 and verboseLevel >=2:
+        print(f"Unexpected keys while loading '{file_path}': {unexpected_keys}")
+
+    for k,p in model.named_parameters():
+        if p.is_meta:
+            txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since parameter '{k}' has no data"
+            raise Exception(txt)
+    for k,b in model.named_buffers():
+        if b.is_meta:
+            txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since buffer '{k}' has no data"
+            raise Exception(txt)
+
+    if do_quantize:
+        if quantization_map != None and len(quantization_map) > 0 :
+            if verboseLevel >=1:
+                print("Model already quantized")
+        else:
+            if _quantize(model, quantizationType, verboseLevel=verboseLevel, model_id=file_path):
+                quantization_map = model._quanto_map  
+
+    if pinToMemory:
+        _pin_to_memory(model, file_path, partialPinning = partialPinning, verboseLevel = verboseLevel)
+
+    return
+
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
+    """save the weights of a model and quantize them if requested
+    These weights can be loaded again using 'load_model_data'
+    """       
+    
+    config = None
+    extra_meta = None
+    verboseLevel = _compute_verbose_level(verboseLevel)
+    if config_file_path !=None:
+        with open(config_file_path, "r", encoding="utf-8") as reader:
+            text = reader.read()
+            config= json.loads(text)
+    elif hasattr(model, "_config"):
+        config = model._config
+    elif hasattr(model, "config"):
+        config_fullpath = None
+        config_obj = getattr(model,"config")
+        config_path = getattr(config_obj,"_name_or_path", None)
+        if config_path != None:
+            config_fullpath = os.path.join(config_path, "config.json")      
+            config_fullpath = _get_model(config_fullpath)
+
+            # if not os.path.isfile(config_fullpath):
+            #     config_fullpath = None
+        if config_fullpath is None:                            
+            config_fullpath =  os.path.join(os.path.dirname(file_path), "config.json")
+        if os.path.isfile(config_fullpath):
+            with open(config_fullpath, "r", encoding="utf-8") as reader:
+                text = reader.read()
+                config= json.loads(text)
+
+    if do_quantize:
+        _quantize(model, weights=quantizationType, model_id=file_path, verboseLevel=verboseLevel)
+    
+    quantization_map = getattr(model, "_quanto_map", None)
+
+    from collections import OrderedDict
+
+    cache_ref = {}
+    tied_weights_map = {}
+    sd = model.state_dict()
+    out_sd = OrderedDict()
+
+
+    for name, weight  in sd.items():
+        ref = _get_tensor_ref(weight)
+        match = cache_ref.get(ref, None)
+        if match != None:
+            tied_list = tied_weights_map.get(match, [])
+            tied_list.append(name)
+            tied_weights_map[match] = tied_list 
+        else:
+            out_sd[name] = weight 
+            cache_ref[ref] = name
+
+    if len(tied_weights_map) > 0:
+        extra_meta = { "tied_weights_map" : tied_weights_map }
+
+    if verboseLevel >=1:
+        print(f"Saving file '{file_path}")
+
+    safetensors2.torch_write_file(out_sd,  file_path , quantization_map = quantization_map, config = config, extra_meta= extra_meta)
+    if verboseLevel >=1:
+        print(f"File '{file_path}' saved")
+
+
+def extract_models(obj = None, prefix = None):
+    if isinstance(obj, str): # for compatibility as the two args were switched
+        bkp = prefix
+        prefix = obj
+        obj = bkp
+
+    pipe = {}
+    if obj == None:
+        raise Exception("an object to analyze must be provided")
+    if prefix==None or len(prefix)==0:
+        prefix = ""
+    elif prefix[ -1:] != "/":
+        prefix  + "/"        
+    
+    for name in dir(obj):
+        if name in ["_execution_device"]:
+            continue            
+        element = getattr(obj,name)
+        if name  in ("pipeline", "pipe"):
+            pipeline = element
+            if  hasattr(pipeline , "components") and isinstance(pipeline.components, dict):
+                for k, model in pipeline.components.items():
+                    if model != None:
+                        pipe[prefix  + k ] = model
+        elif isinstance(element, torch.nn.Module) and name!="base_model": 
+            if prefix + name in pipe:
+                pipe[prefix + "_" + name ] = element
+            else:
+                pipe[prefix + name ] = element
+        elif isinstance(element, dict):
+            for k, element in element.items():
+                if  hasattr(element , "pipeline"):
+                    pipe.update( extract_models(prefix + k,element ))
+
+
+    return pipe
+
+def get_model_name(model):
+    return model.name
+
+class HfHook:
+    def __init__(self):
+        self.execution_device = "cuda"
+
+    def init_hook(self, module):
+        return module
+
+    def detach_hook(self, module):
+        return module
+    
+last_offload_obj = None
+class offload:
+    def __init__(self):
+        self.active_models = []
+        self.active_models_ids = []
+        self.models = {}
+        self.cotenants_map = { 
+                            "text_encoder": ["vae", "text_encoder_2"],
+                            "text_encoder_2": ["vae", "text_encoder"],                             
+                        }
+        self.verboseLevel = 0
+        self.blocks_of_modules = {}
+        self.blocks_of_modules_sizes = {}
+        self.anyCompiledModule = False
+        self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
+        self.last_reserved_mem_check =0
+        self.loaded_blocks = {}
+        self.prev_blocks_names = {}
+        self.next_blocks_names = {}
+        self.preloaded_blocks_per_model = {}
+        self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
+        self.transfer_stream = torch.cuda.Stream()
+        self.async_transfers = False
+        self.parameters_ref  = {} 
+        self.max_reservable_memory = 0
+
+        global last_offload_obj
+        last_offload_obj = self
+
+        
+    def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name, submodule_name):
+
+        if blocks_name!=None and ".lora_" in blocks_name:
+            blocks_name = None
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        if entry_name in self.blocks_of_modules:
+            blocks_params = self.blocks_of_modules[entry_name]
+            blocks_params_size = self.blocks_of_modules_sizes[entry_name]
+        else:
+            blocks_params = []
+            self.blocks_of_modules[entry_name] = blocks_params
+            blocks_params_size = 0
+            if blocks_name !=None:
+                prev_entry_name = None if prev_block_name == None else  model_id + "/" + prev_block_name
+                self.prev_blocks_names[entry_name] =  prev_entry_name
+                if not prev_block_name == None:
+                    self.next_blocks_names[prev_entry_name] = entry_name        
+        bef = blocks_params_size
+
+        for k,p in submodule.named_parameters(recurse=False):
+            param_size = 0
+            ref = _get_tensor_ref(p)
+            tied_param =  self.parameters_ref.get(ref, None)
+            if isinstance(p, QTensor):
+                blocks_params.append( (submodule, k, p, False, tied_param ) )
+
+                if p._qtype == qint4:
+                    if hasattr(p,"_scale_shift"):
+                        param_size += torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        param_size += torch.numel(p._data._data) * p._data._data.element_size()
+                    else:
+                        param_size += torch.numel(p._scale) * p._scale.element_size()
+                        param_size += torch.numel(p._shift) * p._shift.element_size()
+                        param_size += torch.numel(p._data._data) * p._data._data.element_size()
+                else:
+                    param_size += torch.numel(p._scale) * p._scale.element_size()
+                    param_size += torch.numel(p._data) * p._data.element_size()
+            else:
+                blocks_params.append( (submodule, k, p, False, tied_param) )
+                param_size += torch.numel(p.data) * p.data.element_size()
+
+
+            if tied_param == None:
+                blocks_params_size +=  param_size
+                self.parameters_ref[ref] = (submodule, k)
+
+        for k, p in submodule.named_buffers(recurse=False):
+            blocks_params.append( (submodule, k, p, True, None) )
+            blocks_params_size += p.data.nbytes
+
+        aft = blocks_params_size
+
+        # if blocks_name is None:
+        #     print(f"Default: {model_id}/{submodule_name} : {(aft-bef)/ONE_MB:0.2f} MB")
+        #     pass
+
+
+        self.blocks_of_modules_sizes[entry_name] = blocks_params_size
+
+
+        return blocks_params_size
+
+
+    def can_model_be_cotenant(self, model_id):
+        potential_cotenants= self.cotenants_map.get(model_id, None)
+        if potential_cotenants is None: 
+            return False
+        for existing_cotenant in self.active_models_ids:
+            if existing_cotenant not in potential_cotenants: 
+                return False    
+        return True
+
+    def _move_loras(self, loras_active_adapters, loras_modules,  to_GPU):
+        for name, lora_module in loras_modules.items():
+            for adapter in loras_active_adapters:
+                lora_data = lora_module.get(adapter, None)
+                if lora_data == None:
+                    continue                     
+                key = adapter + '_GPU'
+                if to_GPU:
+                    lora_module[key] = [None if item == None else item.cuda(non_blocking=True) for item in lora_data[ :-1] ] + lora_data[ -1:] 
+                elif key in lora_module:
+                    del lora_module[key]
+            
+    @torch.compiler.disable()
+    def gpu_load_blocks(self, model_id, blocks_name, preload = False):
+        # cl = clock.start()
+
+
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        
+        def cpu_to_gpu(stream_to_use, blocks_params): #, record_for_stream = None
+            model = self.models[model_id]
+            loras_modules = {}
+            loras_active_adapters =  getattr(model ,"_loras_active_adapters", None)
+            if loras_active_adapters == None or len(loras_active_adapters) == 0:
+                loras_model_data = None
+            else:
+                loras_model_data =  getattr(model, "_loras_model_data", None)
+
+            with torch.cuda.stream(stream_to_use):
+                for param in blocks_params:
+                    parent_module, n, p, is_buffer, tied_param = param
+
+                    if tied_param != None:
+                        tied_p = getattr( tied_param[0], tied_param[1]) 
+                        if tied_p.is_cuda:
+                            setattr(parent_module, n , tied_p)
+                            continue
+
+                    q = p.to("cuda", non_blocking=True)
+                    if is_buffer:
+                        q = torch.nn.Buffer(q)
+                    else:
+                        q = torch.nn.Parameter(q , requires_grad=False)
+                    setattr(parent_module, n , q)
+
+                    if tied_param != None:
+                        setattr( tied_param[0], tied_param[1], q) 
+                    del p, q
+                    if loras_model_data != None:
+                        lora_data =  loras_model_data.get(parent_module, None)
+                        if lora_data != None:
+                            loras_modules[parent_module]= lora_data
+                if len(loras_modules) > 0:
+                    self._move_loras(loras_active_adapters, loras_modules, True)
+
+        loaded_block = self.loaded_blocks[model_id]
+
+        if not preload and loaded_block != None:
+            self.gpu_unload_blocks(model_id, loaded_block)
+            if self.ready_to_check_mem():
+                self.empty_cache_if_needed()
+
+
+        if self.verboseLevel >=2:
+            model = self.models[model_id]
+            model_name = model._get_name()
+            # if not preload:
+            #     print(f"Request to load model {entry_name} ({model_name}) in GPU")
+                
+
+        if self.async_transfers and blocks_name != None:
+            prev = self.prev_blocks_names[entry_name]
+            first = prev == None or prev != loaded_block
+            next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
+            if first:
+                if self.verboseLevel >=2:
+                    if preload:
+                        print(f"Preloading model {entry_name} ({model_name}) in GPU")
+                    else:
+                        print(f"Loading model {entry_name} ({model_name}) in GPU")
+                cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
+
+            torch.cuda.synchronize()
+
+            if next_blocks_entry != None:
+                if self.verboseLevel >=2:
+                    print(f"Prefetching model {next_blocks_entry} ({model_name}) in GPU")
+                cpu_to_gpu(self.transfer_stream, self.blocks_of_modules[next_blocks_entry]) #, self.default_stream
+
+        else:
+            if self.verboseLevel >=2:
+                print(f"Loading model {entry_name} ({model_name}) in GPU")
+            cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
+            torch.cuda.synchronize()
+        if not preload:
+            self.loaded_blocks[model_id] = blocks_name           
+
+        # cl.stop()
+        # print(f"load time: {cl.format_time_gap()}")
+
+    @torch.compiler.disable()
+    def gpu_unload_blocks(self, model_id, blocks_name):
+        # cl = clock.start()
+        if blocks_name != None and blocks_name == self.loaded_blocks[model_id]:
+            self.loaded_blocks[model_id] = None 
+
+
+        blocks_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        if self.verboseLevel >=2:
+            model = self.models[model_id]
+            model_name = model._get_name()
+            print(f"Unloading model {blocks_name} ({model_name}) from GPU")
+ 
+        blocks_params = self.blocks_of_modules[blocks_name]
+        model = self.models[model_id]
+        loras_modules = {}
+        loras_active_adapters =  getattr(model ,"_loras_active_adapters", None)
+        if loras_active_adapters == None or len(loras_active_adapters) == 0 :
+            loras_model_data = None
+        else:
+            loras_model_data =  getattr(model, "_loras_model_data", None)
+
+        for param in blocks_params:
+            parent_module, n, p, is_buffer, _  = param
+            if is_buffer:
+                q = torch.nn.Buffer(p)
+            else:
+                q = torch.nn.Parameter(p , requires_grad=False)
+            setattr(parent_module, n , q)
+            del p, q 
+
+            if loras_model_data != None:
+                lora_data =  loras_model_data.get(parent_module, None)
+                if lora_data != None:
+                    loras_modules[parent_module]= lora_data
+
+        if len(loras_modules) > 0:
+            self._move_loras(loras_active_adapters, loras_modules, False)
+
+        # cl.stop()
+        # print(f"unload time: {cl.format_time_gap()}")
+
+    # @torch.compiler.disable()
+    def gpu_load(self, model_id):
+        model = self.models[model_id]
+        self.active_models.append(model)
+        self.active_models_ids.append(model_id)
+        self.gpu_load_blocks(model_id, None, True)
+        for block_name in self.preloaded_blocks_per_model[model_id]:
+            self.gpu_load_blocks(model_id, block_name, True)
+
+    def unload_all(self):
+        for model_id in self.active_models_ids:
+            self.gpu_unload_blocks(model_id, None)      
+            for block_name in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_unload_blocks(model_id, block_name)
+
+            loaded_block = self.loaded_blocks[model_id]
+            if loaded_block != None:
+                self.gpu_unload_blocks(model_id, loaded_block)
+                entry_name = model_id + "/" + loaded_block
+                next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
+                if next_blocks_entry != None:
+                    pos = next_blocks_entry.rfind("/")
+                    torch.cuda.synchronize()
+                    self.gpu_unload_blocks(model_id, next_blocks_entry[pos+1:])      
+                self.loaded_blocks[model_id] = None  
+ 
+        self.active_models = []
+        self.active_models_ids = []
+        torch.cuda.empty_cache()
+        gc.collect()
+        self.last_reserved_mem_check = time.time()
+
+    def move_args_to_gpu(self, dtype, *args, **kwargs):
+        new_args= []
+        new_kwargs={}
+
+        for arg in args:
+            if torch.is_tensor(arg):    
+                if arg.dtype == torch.float32:
+                    arg = arg.to(dtype).cuda(non_blocking=True)
+                elif not arg.is_cuda:
+                    arg = arg.cuda(non_blocking=True)
+            new_args.append(arg)
+        for k in kwargs:
+            arg = kwargs[k]
+            if torch.is_tensor(arg):
+                if arg.dtype == torch.float32:
+                    arg = arg.to(dtype).cuda(non_blocking=True)             
+                elif not arg.is_cuda:
+                    arg = arg.cuda(non_blocking=True)             
+            new_kwargs[k]= arg
+        
+        return new_args, new_kwargs
+
+    def ready_to_check_mem(self):
+        if self.anyCompiledModule:
+             return
+        cur_clock = time.time()
+        # can't check at each call if we can empty the cuda cache as quering the reserved memory value is a time consuming operation
+        if (cur_clock - self.last_reserved_mem_check)<0.200:
+            return False
+        self.last_reserved_mem_check = cur_clock
+        return True        
+
+
+    def empty_cache_if_needed(self):
+        mem_reserved = torch.cuda.memory_reserved()
+        mem_threshold = 0.9*self.device_mem_capacity
+        if mem_reserved >= mem_threshold:            
+            mem_allocated = torch.cuda.memory_allocated()
+            if mem_allocated <= 0.70 * mem_reserved: 
+                # print(f"Cuda empty cache triggered as Allocated Memory ({mem_allocated/1024000:0f} MB) is lot less than Cached Memory ({mem_reserved/1024000:0f} MB)  ")
+                torch.cuda.empty_cache()
+                tm= time.time()
+                if self.verboseLevel >=2:
+                    print(f"Empty Cuda cache at {tm}")
+                # print(f"New cached memory after purge is {torch.cuda.memory_reserved()/1024000:0f} MB)  ")
+
+
+    def any_param_or_buffer(self, target_module: torch.nn.Module):
+        
+        for _ in target_module.parameters(recurse= False):
+            return True
+        
+        for _ in target_module.buffers(recurse= False):
+            return True
+        
+        return False
+
+    def _get_lora_scaling(self, loras_scaling, model, active_adapter):
+        scaling_list = loras_scaling[active_adapter]
+        if isinstance(scaling_list, list):
+            step_no =getattr(model, "_lora_step_no", 0)
+            return scaling_list[step_no]
+        else:
+            return float(scaling_list)
+
+
+
+    def _lora_generic_forward(self, model, submodule, loras_data, func, *args, **kwargs) -> torch.Tensor:
+
+        weight = submodule.weight 
+        bias =  getattr(submodule, "bias", None) 
+        original_weight = None 
+        original_bias = None
+        active_adapters = model._loras_active_adapters
+        loras_scaling = model._loras_scaling
+        first_weight =  True
+        first_bias =  True
+        for active_adapter in active_adapters:
+            data = loras_data.get(active_adapter + '_GPU', None)
+            if data == None:
+                continue
+            diff_w , _ , diff_b, alpha = data
+            if first_weight:
+                original_weight= weight.clone() if weight != None else None
+                first_weight = False
+            if first_bias:
+                original_bias= bias.clone() if bias != None else None
+                first_bias = False
+            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
+            if diff_w != None:
+                weight.add_(diff_w, alpha= scaling)
+                diff_w = None
+            if diff_b != None:
+                bias.add_(diff_b, alpha= scaling)
+                diff_b = None
+
+        ret = func(*args, **kwargs )
+
+        weight.data  = original_weight  if original_weight != None else None 
+        if original_bias != None:
+            bias.data = original_bias
+
+        return ret
+
+
+    def _lora_linear_forward(self, model, submodule, loras_data, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        weight = submodule.weight
+        active_adapters = model._loras_active_adapters
+        loras_scaling = model._loras_scaling
+        training = False
+
+        dtype = weight.dtype 
+        if weight.shape[-1] < x.shape[-2]: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+            bias = submodule.bias
+            original_bias = True
+            if len(active_adapters) > 0:
+                if isinstance(submodule, QModuleMixin): 
+                    weight = weight.view(weight.shape) # get a persistent copy of the on the fly dequantized weights
+                else:
+                    weight = weight.clone()
+                for active_adapter in active_adapters:
+                    data = loras_data.get(active_adapter + '_GPU', None)
+                    if data == None:
+                        continue                    
+                    lora_A_weight, lora_B_weight, diff_b, alpha = data
+                    scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if lora_A_weight != None:
+                        weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
+                    
+                    if diff_b != None:
+                        if bias == None:
+                            bias = diff_b.clone()
+                            original_bias = False
+                        elif original_bias:
+                            bias = bias.clone()
+                            original_bias = False
+                        bias.add_(diff_b, alpha=scaling)
+                    # base_weight += scaling * lora_B_weight @ lora_A_weight
+            if training:
+                pass
+                # result = torch.nn.functional.linear(dropout(x), base_weight, bias=submodule.bias)
+            else:
+                result = torch.nn.functional.linear(x, weight, bias=bias)
+
+        else:
+            result = torch.nn.functional.linear(x, weight, bias=submodule.bias)
+
+            if len(active_adapters) > 0:
+                x = x.to(dtype)
+
+                for active_adapter in active_adapters:
+                    data = loras_data.get(active_adapter + '_GPU', None)
+                    if data == None:
+                        continue
+                    lora_A, lora_B, diff_b, alpha = data
+                    # dropout = self.lora_dropout[active_adapter]
+                    scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if lora_A == None:
+                        result.add_(diff_b, alpha=scaling)
+                    else:
+                        x = x.to(lora_A.dtype)
+
+                        if training:        
+                            pass                
+                            # y = lora_A(dropout(x))
+                        else:
+                            y = torch.nn.functional.linear(x, lora_A, bias=None)
+                        y = torch.nn.functional.linear(y, lora_B, bias=diff_b)
+                        y*= scaling
+                        result+= y 
+                        del y
+
+        return result
+
+
+    def hook_lora(self, submodule, current_model, model_id, loras_model_data, submodule_name):
+        old_forward = submodule.forward
+
+        loras_data = {}
+        loras_model_data[submodule] = loras_data
+
+        if isinstance(submodule,  torch.nn.Linear):
+            def lora_linear_forward(module,  *args, **kwargs):
+                if len(loras_data) == 0:
+                    return old_forward(*args, **kwargs)
+                else:
+                    # submodule.aaa = submodule_name
+                    return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
+            target_fn = lora_linear_forward
+        else:
+            def lora_generic_forward(module,  *args, **kwargs):
+                if len(loras_data) == 0:
+                    return old_forward(*args, **kwargs)
+                else:
+                    return self._lora_generic_forward(current_model, submodule, loras_data, old_forward, *args, **kwargs)
+            target_fn = lora_generic_forward
+        return functools.update_wrapper(functools.partial(target_fn, submodule), old_forward)
+
+    def ensure_model_loaded(self, model_id):
+        if model_id in self.active_models_ids:
+            return
+        # new_model_id = getattr(module, "_mm_id") 
+        # do not always unload existing models if it is more efficient to keep in them in the GPU 
+        # (e.g: small modules whose calls are text encoders) 
+        if not self.can_model_be_cotenant(model_id) :
+            self.unload_all()
+        self.gpu_load(model_id)
+
+    def hook_preload_blocks_for_compilation(self, target_module, model_id,blocks_name, context):
+
+        # @torch.compiler.disable()
+        def preload_blocks_for_compile(module,  *args, **kwargs):
+            # some_context = context #for debugging
+            if blocks_name != None and blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_load_blocks(model_id, blocks_name)
+
+        # need to be registered before the forward not to be break the efficiency of the compilation chain
+        # it should be at the top of the compilation as this type of hook in the middle of a chain seems to break memory performance
+        target_module.register_forward_pre_hook(preload_blocks_for_compile)        
+
+
+    def hook_check_empty_cache_needed(self, target_module, model, model_id, blocks_name, previous_method,  context):
+
+        dtype = model._dtype
+        qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
+        if qint4quantization:
+            pass
+
+        if hasattr(target_module, "_mm_id"):
+            # no hook for a shared module with no weights (otherwise this will cause models loading / unloading for nothing)
+            orig_model_id = getattr(target_module, "_mm_id")
+            if self.verboseLevel >=2:
+                print(f"Model '{model_id}' shares module '{target_module._get_name()}' with module(s) '{orig_model_id}' ")
+            assert not self.any_param_or_buffer(target_module)
+            if not isinstance(orig_model_id, list):
+                orig_model_id = [orig_model_id]
+            orig_model_id.append(model_id)
+            setattr(target_module, "_mm_id", orig_model_id)
+            target_module.forward = target_module._mm_forward
+            return
+
+        def check_empty_cuda_cache(module, *args, **kwargs):
+            self.ensure_model_loaded(model_id)
+            if blocks_name == None:
+                if self.ready_to_check_mem():
+                    self.empty_cache_if_needed()
+            elif blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_load_blocks(model_id, blocks_name)
+            if qint4quantization and dtype !=None:
+                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
+
+            return previous_method(*args, **kwargs) 
+
+        setattr(target_module, "_mm_id", model_id)
+        setattr(target_module, "_mm_forward", previous_method)
+
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
+
+        
+    def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
+        if hasattr(target_module, "_lock_dtype"):
+            dtype = target_module._lock_dtype 
+        else:
+            dtype = model._dtype
+
+        def check_change_module(module, *args, **kwargs):      
+            self.ensure_model_loaded(model_id)
+            # transfer leftovers inputs that were incorrectly created in the RAM (mostly due to some .device tests that returned incorrectly "cpu")
+            if dtype != None:
+                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
+            return previous_method(*args, **kwargs) 
+  
+        if hasattr(target_module, "_mm_id"):
+            return
+        setattr(target_module, "_mm_id", model_id)
+
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
+
+        if not self.verboseLevel >=1:
+            return
+
+        if module_id == None or module_id =='':
+            model_name = model._get_name()
+            print(f"Hooked to model '{model_id}' ({model_name})")
+
+
+
+    def tune_preloading(self, model_id, current_budget, towers_names):
+        preloaded_blocks = {}
+        preload_total = 0
+        max_blocks_fetch = 0
+
+        self.preloaded_blocks_per_model[model_id] = preloaded_blocks
+
+        if current_budget == 0 or towers_names is None or len(towers_names) == 0 or not self.async_transfers:
+            return
+        # current_budget = 5000 * ONE_MB
+        base_size = self.blocks_of_modules_sizes[model_id] 
+        current_budget -= base_size
+        current_budget = max(0, current_budget)
+        
+        towers = []
+        total_size = 0
+        for tower_name in towers_names:
+            max_floor_size = 0
+            tower_size = 0
+            floors = []
+            prefix = model_id + "/" + tower_name
+            for name, size in self.blocks_of_modules_sizes.items():
+                if name.startswith(prefix):
+                    tower_size += size
+                    floor_no = int(  name[len(prefix): ] )
+                    floors.append( (name, floor_no, size))
+                    max_floor_size = max(max_floor_size, size)
+
+            towers.append( (floors, max_floor_size, tower_size) )
+            total_size += tower_size
+            current_budget -=  2 * max_floor_size
+            current_budget = max(0, current_budget)
+
+        for floors, max_floor_size, tower_size in towers:
+            tower_budget = tower_size / total_size * current_budget
+            preload_blocks_count = int( tower_budget / max_floor_size)
+            preload_total += preload_blocks_count * max_floor_size
+            max_blocks_fetch = max(max_floor_size, max_blocks_fetch)
+            
+            nb_blocks= len(floors)
+            if preload_blocks_count == 0:
+                space_between = 0
+                cursor = len(floors)
+            else:
+                space_between =  (nb_blocks - preload_blocks_count) / preload_blocks_count 
+                cursor = space_between
+            first_non_preloaded = None
+            prev_non_preloaded = None
+            for block in floors:
+                name, i, size = block
+                if i < cursor:
+                    if prev_non_preloaded == None:
+                        first_non_preloaded = name
+                    else:
+                        self.next_blocks_names[prev_non_preloaded] = name
+                        self.prev_blocks_names[name] = prev_non_preloaded
+                    prev_non_preloaded = name
+                else:
+                    self.next_blocks_names[name] = None
+                    self.prev_blocks_names[name] = None
+                    preloaded_blocks[name[ len(model_id) + 1 : ] ] = size
+                    cursor += 1 + space_between
+
+            if prev_non_preloaded != None and len(towers) == 1 : 
+                self.next_blocks_names[prev_non_preloaded] = first_non_preloaded
+                self.prev_blocks_names[first_non_preloaded] = prev_non_preloaded
+            else:
+                self.next_blocks_names[prev_non_preloaded] = None
+
+        self.preloaded_blocks_per_model[model_id] = preloaded_blocks
+
+        if self.verboseLevel >=1:
+            if preload_total == 0:
+                print(f"Async loading plan for model '{model_id}' : base size of {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + " shuttle")
+            else:
+                print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {preload_total/total_size*100:0.1f}% of recurrent layers data) with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + " shuttle")
+
+    def release(self):
+        global last_offload_obj, total_pinned_bytes
+
+        if last_offload_obj == self:
+            last_offload_obj = None
+
+        self.unload_all()
+        self.active_models = None
+        self.default_stream = None 
+        self.transfer_stream = None
+        self.parameters_ref = None
+        keys= [k for k in self.blocks_of_modules.keys()]
+        for k in keys:
+            del self.blocks_of_modules[k]
+
+        self.blocks_of_modules = None
+
+        for model_id, model in self.models.items():
+            move_loras_to_device(model, "cpu")
+            if hasattr(model, "_pinned_bytes"):
+                total_pinned_bytes -= model._pinned_bytes
+            if hasattr(model, "_loras_model_data"):
+                unload_loras_from_model(model)
+            model = None
+
+        self.models = None            
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+
+
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
+    """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
+    pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
+    quantizeTransformer: set True by default will quantize on the fly the video / image model
+    pinnedMemory: move models in reserved memor. This allows very fast performance but requires 50% extra RAM (usually >=64 GB)
+    extraModelsToQuantize: a list of models to be also quantized on the fly (e.g the text_encoder), useful to reduce bith RAM and VRAM consumption
+    budgets: 0 by default (unlimited). If non 0, it corresponds to the maximum size in MB that every model will occupy at any moment
+        (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
+        if pinnedMemory is not enabled
+    """
+    self = offload()
+    self.verboseLevel = verboseLevel
+    safetensors2.verboseLevel = verboseLevel
+    self.modules_data = {}
+    
+    model_budgets = {}
+
+    windows_os =  os.name == 'nt'
+
+    def get_parsed_budget(b):
+        if isinstance(b , str) and b.endswith("%"):
+            return float(b[:-1]) * self.device_mem_capacity
+        else:
+            return b * ONE_MB
+        
+    budget = 0
+    if not budgets is None:
+        if isinstance(budgets , dict):
+            model_budgets = { k : get_parsed_budget(b) for k , b in budgets.items() } 
+            budget = model_budgets.get("*", 0)
+        else:
+            budget = get_parsed_budget(budget) 
+
+    self.async_transfers = asyncTransfers
+
+
+
+    torch.set_default_device('cpu')
+
+    if hasattr(pipe_or_dict_of_modules, "components"):
+        # create a fake Accelerate parameter so that lora loading doesn't change the device
+        pipe_or_dict_of_modules.hf_device_map = torch.device("cuda")
+        pipe_or_dict_of_modules= pipe_or_dict_of_modules.components 
+
+    
+    models = {k: _remove_model_wrapper(v) for k, v in pipe_or_dict_of_modules.items() if isinstance(v, torch.nn.Module)}
+
+    
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    _welcome()        
+    if coTenantsMap != None:
+        self.cotenants_map = coTenantsMap 
+    if loras != None and isinstance(loras, str):
+        loras = [loras]
+    self.models = models
+
+    extraModelsToQuantize =  extraModelsToQuantize if extraModelsToQuantize is not None else []
+    if not isinstance(extraModelsToQuantize, list):
+        extraModelsToQuantize= [extraModelsToQuantize]
+    if quantizeTransformer:
+        extraModelsToQuantize.append("transformer")            
+    models_to_quantize = extraModelsToQuantize
+
+    modelsToPin = []
+    pinAllModels = False
+    if isinstance(pinnedMemory, bool):
+        pinAllModels = pinnedMemory
+    elif isinstance(pinnedMemory, list):            
+        modelsToPin = pinnedMemory
+    else:
+        modelsToPin = [pinnedMemory]
+
+    modelsToCompile = []
+    compileAllModels = False
+    if isinstance(compile, bool):
+        compileAllModels = compile
+    elif isinstance(compile, list):            
+        modelsToCompile = compile
+    else:
+        modelsToCompile = [compile]
+
+    self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
+    if self.anyCompiledModule:
+        torch.compiler.reset()
+        torch._dynamo.config.cache_size_limit = 10000
+    #dynamic=True
+
+      #  torch._logging.set_logs(recompiles=True)
+      #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
+
+    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max)
+    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max) 
+
+    estimatesBytesToPin = 0
+    for model_id in models: 
+        current_model: torch.nn.Module = models[model_id] 
+        # make sure that no RAM or GPU memory is not allocated for gradiant / training
+        current_model.to("cpu").eval()
+        
+        # if the model has just been quantized so there is no need to quantize it again
+        if model_id in models_to_quantize:
+            _quantize(current_model, weights=quantizationType, verboseLevel = self.verboseLevel, model_id=model_id)
+
+        modelPinned = (pinAllModels or model_id in modelsToPin) and not hasattr(current_model,"_already_pinned")
+
+        current_model_size = 0
+        model_dtype = getattr(current_model, "_model_dtype", None)
+        # if model_dtype == None:
+        #     model_dtype = getattr(current_model, "dtype", None)
+        for _ , m in current_model.named_modules():
+            ignore_dtype = hasattr(m, "_lock_dtype")
+            for n, p in m.named_parameters(recurse = False):
+                p.requires_grad = False
+                if isinstance(p, QTensor):
+                    if p._qtype == qint4:
+                        if hasattr(p,"_scale_shift"):
+                            current_model_size +=  torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        else:
+                            current_model_size +=  torch.numel(p._scale) * p._shift.element_size() + torch.numel(p._scale) * p._shift.element_size()
+
+                        current_model_size +=  torch.numel(p._data._data) * p._data._data.element_size()
+
+                    else:
+                        current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
+                        current_model_size +=  torch.numel(p._data) * p._data.element_size()
+                    dtype = p._scale.dtype
+
+                else:
+                    if not ignore_dtype:
+                        dtype = p.data.dtype
+                        if convertWeightsFloatTo != None and dtype == torch.float32 :
+                            # convert any left overs float32 weight to bfloat16 / float16 to divide by 2 the model memory footprint
+                            dtype = convertWeightsFloatTo if model_dtype == None else model_dtype
+                            if dtype != torch.float32:
+                                p.data = p.data.to(dtype)
+                        if model_dtype== None:
+                            model_dtype = dtype
+                        else:
+                            if model_dtype != dtype:
+                                pass
+                            assert model_dtype == dtype
+                    current_model_size +=  torch.numel(p.data) * p.data.element_size()
+                current_model._dtype = model_dtype
+        for b in current_model.buffers():
+            # do not convert 32 bits float to 16 bits since buffers are few (and potential gain low) and usually they are needed for precision calculation (for instance Rope)
+            current_model_size +=  torch.numel(b.data) * b.data.element_size()
+
+        if modelPinned:
+            estimatesBytesToPin += current_model_size
+        
+
+        model_budget = model_budgets[model_id] if model_id in model_budgets else budget
+        if workingVRAM != None:
+            model_minimumVRAM = -1
+            if isinstance(workingVRAM, dict):
+                if model_id in workingVRAM:
+                    model_minimumVRAM = get_parsed_budget(workingVRAM[model_id])
+                elif "*" in model_id in workingVRAM:
+                    model_minimumVRAM = get_parsed_budget(workingVRAM["*"])
+            else:
+                model_minimumVRAM = get_parsed_budget(workingVRAM)
+
+            if model_minimumVRAM > 0:
+                new_budget = self.device_mem_capacity -  model_minimumVRAM
+                new_budget = 1 if new_budget  < 0 else new_budget
+                model_budget =  new_budget if model_budget == 0 or new_budget < model_budget else model_budget
+        if  model_budget > 0 and model_budget > current_model_size:
+            model_budget = 0
+        coef =0.8
+        if current_model_size > coef * self.device_mem_capacity and model_budget == 0 or model_budget > coef * self.device_mem_capacity:
+            if verboseLevel >= 1:
+                if model_budget == 0:
+                    print(f"Model '{model_id}' is too large ({current_model_size/ONE_MB:0.1f} MB) to fit entirely in {coef * 100}% of the VRAM (max capacity is {coef * self.device_mem_capacity/ONE_MB}) MB)")
+                else:
+                    print(f"Budget ({budget/ONE_MB:0.1f} MB) for Model '{model_id}' is too important so that this model can fit in the VRAM (max capacity is {self.device_mem_capacity/ONE_MB}) MB)")
+                print(f"Budget allocation for this model has been consequently reduced to the 80% of max GPU Memory ({coef * self.device_mem_capacity/ONE_MB:0.1f} MB). This may not leave enough working VRAM and you will probably need to define manually a lower budget for this model.")
+                model_budget = coef * self.device_mem_capacity 
+                
+        
+        model_budgets[model_id] = model_budget
+
+
+    if not partialPinning and estimatesBytesToPin > 0 and estimatesBytesToPin >= (max_reservable_memory - total_pinned_bytes):
+        if self.verboseLevel >=1:
+            print(f"Switching to partial pinning since full requirements for pinned models is {estimatesBytesToPin/ONE_MB:0.1f} MB while estimated available reservable RAM is {(max_reservable_memory-total_pinned_bytes)/ONE_MB:0.1f} MB. You may increase the value of parameter 'perc_reserved_mem_max' to a value higher than {perc_reserved_mem_max:0.2f} to force full pinnning." )
+        partialPinning = True
+
+    #  Hook forward methods of modules 
+    for model_id in models: 
+        current_model: torch.nn.Module = models[model_id] 
+        towers_names, towers_modules = _detect_main_towers(current_model)
+        # compile main iterative modules stacks ("towers")
+        compilationInThisOne = compileAllModels or model_id in modelsToCompile 
+        if compilationInThisOne:
+            if self.verboseLevel>=1:
+                if len(towers_modules)>0:
+                    formated_tower_names = [name + '*' for name in towers_names]
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
+                else:
+                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
+
+            for submodel in towers_modules:
+                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                    #dynamic=True,
+                
+        if pinAllModels or model_id in modelsToPin:
+            if hasattr(current_model,"_already_pinned"):
+                if self.verboseLevel >=1:
+                    print(f"Model '{model_id}' already pinned to reserved memory")
+            else:
+                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel)            
+    
+        current_budget = model_budgets[model_id]
+        cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
+        self.loaded_blocks[model_id] = None
+        any_lora =  loras !=None and model_id in loras
+        if any_lora: 
+            loras_model_data = {}
+            current_model._loras_model_data = loras_model_data 
+        for submodule_name, submodule in current_model.named_modules():  
+            # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
+            # (it is queried in many pipelines even if offloading is not properly implemented)  
+            if not hasattr(submodule, "_hf_hook"):
+                setattr(submodule, "_hf_hook", HfHook())
+            if current_budget > 0 and len(submodule_name) > 0:
+                if cur_blocks_prefix != None:
+                    if submodule_name.startswith(cur_blocks_prefix):
+                        depth_prefix = cur_blocks_prefix.split(".")
+                        depth_name = submodule_name.split(".")
+                        level  =  depth_name[len(depth_prefix)-1]                        
+                        pre , num = _extract_num_from_str(level)
+                        if num != cur_blocks_seq and not (is_mod_seq and cur_blocks_seq>=0):
+                            prev_blocks_name = cur_blocks_name
+                            cur_blocks_name =  cur_blocks_prefix + str(num)
+                            # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                        cur_blocks_seq = num
+                    else:
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
+
+                if cur_blocks_prefix == None:
+                    pre , num = _extract_num_from_str(submodule_name)
+                    if isinstance(submodule, (torch.nn.ModuleList, torch.nn.Sequential)):  
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre + ".", None, -1, isinstance(submodule, torch.nn.Sequential)
+                    elif num >=0:
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre, None, num, False
+                        cur_blocks_name = submodule_name
+                        # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                          
+ 
+            if hasattr(submodule, "forward"):
+                # if  any_lora and isinstance(submodule, ( torch.nn.Linear, torch.nn.Conv3d, torch.nn.LayerNorm)):
+                if  any_lora and  hasattr(submodule,"weight"):
+                    submodule_method = self.hook_lora(submodule, current_model, model_id, loras_model_data, submodule_name)                
+                else:
+                    submodule_method = getattr(submodule, "forward")
+                if callable(submodule_method):   
+                    if len(submodule_name.split("."))==1:
+                        self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method)
+                    elif compilationInThisOne and submodule in towers_modules: 
+                        self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
+                    else:
+                        self.hook_check_empty_cache_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+
+                self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
+
+
+        self.tune_preloading(model_id, current_budget, towers_names)
+
+
+    if self.verboseLevel >=2:
+        start_num, prev_num, prev_pre, prev_size  = -1, -1, None, -1
+         
+        def print_size_range(n,start_num,prev_num, prev_size ):
+            if prev_num < 0:
+                print(f"Size of submodel '{n}': {prev_size/ONE_MB:.1f} MB")
+            elif prev_num - start_num <=1:
+                print(f"Size of submodel '{n+ str(start_num)}': {prev_size/ONE_MB:.1f} MB")
+            else:
+                print(f"Size of submodel '{n+ str(start_num) +'-'+ str(prev_num)}': {(prev_num-start_num+1)*prev_size/ONE_MB:.1f} MB ({prev_size/ONE_MB:.1f} MB x {prev_num-start_num+1})")
+
+        for n, size in self.blocks_of_modules_sizes.items():
+            size = int(size / 10000)* 10000
+            pre, num = _extract_num_from_str(n) if "/" in n else (n, -1)
+            if prev_pre == None :
+                start_num = num
+            elif prev_pre != pre or prev_pre == pre and size != prev_size:
+                print_size_range(prev_pre,start_num,prev_num, prev_size )
+                start_num = num
+            prev_num, prev_pre, prev_size = num, pre, size
+        if prev_pre != None:
+            print_size_range(prev_pre,start_num,prev_num, prev_size )
+
+  
+    torch.set_default_device('cuda')
+    torch.cuda.empty_cache()
+    gc.collect()         
+
+    return self
+
+
+def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.VerylowRAM_LowVRAM, verboseLevel = -1, **overrideKwargs):
+    """Apply a configuration profile that depends on your hardware:
+    pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
+    profile_name : num of the profile:
+        HighRAM_HighVRAM_Fastest (=1): will try to load entirely a model  in VRAM and to keep a copy in reserved RAM for fast loading / unloading
+        HighRAM_LowVRAM_Fast (=2): will try to load only the needed parts of a model in VRAM and to keep a copy in reserved RAM for fast loading / unloading
+        LowRAM_HighVRAM_Medium (=3): will try to load entirely a model  in VRAM and to keep a copy in reserved RAM for fast loading / unloading, 8 bits quantization of main model
+        LowRAM_LowVRAM_Slow (=4): will try to load only the needed parts of a model in VRAM and to keep a copy in reserved RAM for fast loading / unloading, 8 bits quantization of main models
+        VerylowRAM_LowVRAM_Slowest (=5): will try to load only the needed parts of a model in VRAM, 8 bits quantization of main models
+    overrideKwargs: every parameter accepted by Offload.All can be added here to override the profile choice
+        For instance set quantizeTransformer = False to disable transformer quantization which is by default in every profile
+    """      
+
+    _welcome()
+
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    modules = pipe_or_dict_of_modules
+
+    if hasattr(modules, "components"):
+        modules= modules.components 
+
+    modules = {k: _remove_model_wrapper(v) for k, v in modules.items() if isinstance(v, torch.nn.Module)}
+    module_names = {k: _get_module_name(v) for k, v in modules.items() }
+
+    default_extraModelsToQuantize = []
+    quantizeTransformer = True
+    
+    models_to_scan = ("text_encoder", "text_encoder_2")
+    candidates_to_quantize = ("t5", "llama", "llm")
+    for model_id  in models_to_scan:
+        if model_id in module_names: 
+            name = module_names[model_id]
+            for candidate in candidates_to_quantize:
+                if candidate in name:
+                    default_extraModelsToQuantize.append(model_id)
+                    break
+
+
+    # transformer (video or image generator) should be as small as possible not to occupy space that could be used by actual image data
+    # on the other hand the text encoder should be quite large (as long as it fits in 10 GB of VRAM) to reduce sequence offloading
+
+    budgets = {}
+    if "transformer" in modules:
+        budgets["transformer"] = 1200    
+
+    extraModelsToQuantize = None
+    asyncTransfers = True
+
+    if profile_no == profile_type.HighRAM_HighVRAM:
+        pinnedMemory= True
+        budgets = None
+        # info = "You have chosen a profile that may require 48 GB of RAM and up to 24 GB of VRAM on some applications."
+    elif profile_no == profile_type.HighRAM_LowVRAM:
+        pinnedMemory= True
+        budgets["*"] =  3000
+        # info = "You have chosen a profile that may require 48 GB of RAM and up to 12 GB of VRAM on some applications."
+    elif profile_no == profile_type.LowRAM_HighVRAM:
+        pinnedMemory= "transformer"
+        extraModelsToQuantize = default_extraModelsToQuantize
+        budgets = None
+        # info = "You have chosen a Medium speed profile that may require 32 GB of RAM and up to 24 GB of VRAM on some applications."
+    elif profile_no == profile_type.LowRAM_LowVRAM:
+        pinnedMemory= "transformer"
+        extraModelsToQuantize = default_extraModelsToQuantize
+        budgets["*"] =  3000
+        # info = "You have chosen a profile that usually may require 32 GB of RAM and up to 12 GB of VRAM on some applications."
+    elif profile_no == profile_type.VerylowRAM_LowVRAM:
+        pinnedMemory= False
+        extraModelsToQuantize = default_extraModelsToQuantize
+        budgets["*"] =  3000
+        if "transformer" in modules:
+            budgets["transformer"] = 400    
+        #asyncTransfers = False
+        # info = "You have chosen the slowest profile that may require 24 GB of RAM and up to 10 GB of VRAM on some applications."
+    else:
+        raise Exception("Unknown profile")
+    # info += " Actual requirements may varry depending on the application or on the tuning done to the profile."
+    info =""    
+    if budgets != None and len(budgets) == 0:
+        budgets = None
+
+    CrLf = '\r\n'
+    kwargs = { "pinnedMemory": pinnedMemory,  "extraModelsToQuantize" : extraModelsToQuantize, "budgets": budgets, "asyncTransfers" : asyncTransfers, "quantizeTransformer": quantizeTransformer   }
+
+    if verboseLevel>=2:
+        info = info  + f"Profile '{profile_type.tostr(profile_no)}' sets the following options:" #CrLf 
+        for k,v in kwargs.items():
+            if k in overrideKwargs: 
+                info = info + CrLf + f"- '{k}':  '{kwargs[k]}' overriden with value '{overrideKwargs[k]}'"
+            else:
+                info = info + CrLf + f"- '{k}':  '{kwargs[k]}'"
+
+    for k,v in overrideKwargs.items():
+        kwargs[k] = overrideKwargs[k]
+
+    if info:
+        print(info)
+
+    return all(pipe_or_dict_of_modules, verboseLevel = verboseLevel, **kwargs)

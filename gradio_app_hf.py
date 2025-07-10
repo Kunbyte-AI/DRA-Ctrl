@@ -1,3 +1,6 @@
+from utils import offload
+from utils.offload import profile_type
+
 import os
 import sys
 import torch
@@ -26,7 +29,6 @@ from transformers import pipeline
 from models import HunyuanVideoTransformer3DModel
 from pipelines import HunyuanVideoImageToVideoPipeline
 
-
 header = """
 # DRA-Ctrl Gradio App
 
@@ -46,7 +48,35 @@ there's no need to manually input edge maps, depth maps, or other condition imag
 The corresponding condition images will be automatically extracted.
 """
 
-def init_basemodel():
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="DRA-Ctrl Gradio App")
+    parser.add_argument(
+        "--vram_optimization",
+        type=str,
+        required=True,
+        default="No_Optimization",
+        help="VRAM optimization strategy. (Required, default: NO_OPTIMIZATION)"
+    )
+    args = parser.parse_args()
+
+    vram_optimization_opts = [
+        'No_Optimization',
+        'HighRAM_HighVRAM',
+        'HighRAM_LowVRAM',
+        'LowRAM_HighVRAM',
+        'LowRAM_LowVRAM',
+        'VerylowRAM_LowVRAM'
+    ]
+    if args.vram_optimization not in vram_optimization_opts:
+        raise ValueError(
+            f"Invalid vram_optimization: {args.vram_optimization}. "
+            f"Must be one of {vram_optimization_opts}"
+        )
+
+    return args.vram_optimization
+
+def init_basemodel(vram_optimization):
     global transformer, scheduler, vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, image_processor, pipe, current_task
     pipe = None
     current_task = None
@@ -54,31 +84,27 @@ def init_basemodel():
     # init models
     device = "cuda" if torch.cuda.is_available() else "cpu"
     weight_dtype = torch.bfloat16
-    i2v_model_root = 'ckpts/HunyuanVideo-I2V'
-    transformer = HunyuanVideoTransformer3DModel.from_pretrained(f'{i2v_model_root}/transformer', inference_subject_driven=False).requires_grad_(False).to(device, dtype=weight_dtype)
+    i2v_model_root = '/data/home/caohengyuan/iLego_chy/cache/HunyuanVideo-I2V' # 'ckpts/HunyuanVideo-I2V'
+    transformer = HunyuanVideoTransformer3DModel.from_pretrained(f'{i2v_model_root}/transformer', 
+                                                                 inference_subject_driven=False, 
+                                                                 low_cpu_mem_usage=True, 
+                                                                 torch_dtype=weight_dtype).requires_grad_(False)
     scheduler = diffusers.FlowMatchEulerDiscreteScheduler()
-    vae = diffusers.AutoencoderKLHunyuanVideo.from_pretrained(f'{i2v_model_root}/vae').requires_grad_(False).to(device, dtype=weight_dtype)
-    text_encoder = transformers.LlavaForConditionalGeneration.from_pretrained(f'{i2v_model_root}/text_encoder').requires_grad_(False).to(device, dtype=weight_dtype)
-    text_encoder_2 = transformers.CLIPTextModel.from_pretrained(f'{i2v_model_root}/text_encoder_2').requires_grad_(False).to(device, dtype=weight_dtype)
+    vae = diffusers.AutoencoderKLHunyuanVideo.from_pretrained(f'{i2v_model_root}/vae', 
+                                                              low_cpu_mem_usage=True, 
+                                                              torch_dtype=weight_dtype).requires_grad_(False)
+    text_encoder = transformers.LlavaForConditionalGeneration.from_pretrained(f'{i2v_model_root}/text_encoder', 
+                                                                              low_cpu_mem_usage=True, 
+                                                                              torch_dtype=weight_dtype).requires_grad_(False)
+    text_encoder_2 = transformers.CLIPTextModel.from_pretrained(f'{i2v_model_root}/text_encoder_2', 
+                                                                low_cpu_mem_usage=True, 
+                                                                torch_dtype=weight_dtype).requires_grad_(False)
     tokenizer = transformers.AutoTokenizer.from_pretrained(f'{i2v_model_root}/tokenizer')
     tokenizer_2 = transformers.CLIPTokenizer.from_pretrained(f'{i2v_model_root}/tokenizer_2')
     image_processor = transformers.CLIPImageProcessor.from_pretrained(f'{i2v_model_root}/image_processor')
-    torch.cuda.empty_cache()
-    gc.collect()
 
     vae.enable_tiling()
     vae.enable_slicing()
-
-    pipe = HunyuanVideoImageToVideoPipeline(
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        transformer=transformer,
-        vae=vae,
-        scheduler=copy.deepcopy(scheduler),
-        text_encoder_2=text_encoder_2,
-        tokenizer_2=tokenizer_2,
-        image_processor=image_processor,
-    )
 
     # insert LoRA
     lora_config = LoraConfig(
@@ -100,35 +126,35 @@ def init_basemodel():
     def create_hacked_forward(module):
         if not hasattr(module, 'original_forward'):
             module.original_forward = module.forward
-        lora_forward = module.forward
-        non_lora_forward = module.base_layer.forward
         img_sequence_length = int((512 / 8 / 2) ** 2)
         encoder_sequence_length = 144 + 252 # encoder sequence: 144 img 252 txt
         num_imgs = 4
         num_generated_imgs = 3
 
         def hacked_lora_forward(self, x, *args, **kwargs):
+            lora_forward = self.original_forward
+
             if x.shape[1] == img_sequence_length * num_imgs and len(x.shape) > 2:
                 return torch.cat((
                     lora_forward(x[:, :-img_sequence_length*num_generated_imgs], *args, **kwargs),
-                    non_lora_forward(x[:, -img_sequence_length*num_generated_imgs:], *args, **kwargs)
+                    self.base_layer(x[:, -img_sequence_length*num_generated_imgs:], *args, **kwargs)
                 ), dim=1)
             elif x.shape[1] == encoder_sequence_length * 2 or x.shape[1] == encoder_sequence_length:
                 return lora_forward(x, *args, **kwargs)
             elif x.shape[1] == img_sequence_length * num_imgs + encoder_sequence_length:
                 return torch.cat((
                     lora_forward(x[:, :(num_imgs - num_generated_imgs)*img_sequence_length], *args, **kwargs),
-                    non_lora_forward(x[:, (num_imgs - num_generated_imgs)*img_sequence_length:-encoder_sequence_length], *args, **kwargs),
+                    self.base_layer(x[:, (num_imgs - num_generated_imgs)*img_sequence_length:-encoder_sequence_length], *args, **kwargs),
                     lora_forward(x[:, -encoder_sequence_length:], *args, **kwargs)
                 ), dim=1)
             elif x.shape[1] == img_sequence_length * num_imgs + encoder_sequence_length * 2:
                 return torch.cat((
                     lora_forward(x[:, :(num_imgs - num_generated_imgs)*img_sequence_length], *args, **kwargs),
-                    non_lora_forward(x[:, (num_imgs - num_generated_imgs)*img_sequence_length:-2*encoder_sequence_length], *args, **kwargs),
+                    self.base_layer(x[:, (num_imgs - num_generated_imgs)*img_sequence_length:-2*encoder_sequence_length], *args, **kwargs),
                     lora_forward(x[:, -2*encoder_sequence_length:], *args, **kwargs)
                 ), dim=1)
             elif x.shape[1] == 3072:
-                return non_lora_forward(x, *args, **kwargs)
+                return self.base_layer(x, *args, **kwargs)
             else:
                 raise ValueError(
                     f"hacked_lora_forward receives unexpected sequence length: {x.shape[1]}, input shape: {x.shape}!"
@@ -139,6 +165,42 @@ def init_basemodel():
     for n, m in transformer.named_modules():
         if isinstance(m, peft.tuners.lora.layer.Linear):
             m.forward = create_hacked_forward(m)
+
+    pipe = HunyuanVideoImageToVideoPipeline(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        transformer=transformer,
+        vae=vae,
+        scheduler=copy.deepcopy(scheduler),
+        text_encoder_2=text_encoder_2,
+        tokenizer_2=tokenizer_2,
+        image_processor=image_processor,
+    )
+
+    if vram_optimization == 'No_Optimization':
+        pipe.to(device)
+    else:
+        [
+        'No_Optimization',
+        'HighRAM_HighVRAM',
+        'HighRAM_LowVRAM',
+        'LowRAM_HighVRAM',
+        'LowRAM_LowVRAM',
+        'VerylowRAM_LowVRAM'
+    ]
+        if vram_optimization == 'HighRAM_HighVRAM':
+            optimization_type = profile_type.HighRAM_HighVRAM
+        elif vram_optimization == 'HighRAM_HighVRAM':
+            optimization_type = profile_type.HighRAM_HighVRAM
+        elif vram_optimization == 'HighRAM_LowVRAM':
+            optimization_type = profile_type.HighRAM_LowVRAM
+        elif vram_optimization == 'LowRAM_HighVRAM':
+            optimization_type = profile_type.LowRAM_HighVRAM
+        elif vram_optimization == 'LowRAM_LowVRAM':
+            optimization_type = profile_type.LowRAM_LowVRAM
+        elif vram_optimization == 'VerylowRAM_LowVRAM':
+            optimization_type = profile_type.VerylowRAM_LowVRAM
+        offload.profile(pipe, optimization_type)
 
 def process_image_and_text(condition_image, target_prompt, condition_image_prompt, task, random_seed, num_steps, inpainting, fill_x1, fill_x2, fill_y1, fill_y2):
     # set up the model
@@ -239,7 +301,7 @@ def process_image_and_text(condition_image, target_prompt, condition_image_promp
         num_inference_steps=num_steps,
         guidance_scale=6.0,
         num_videos_per_prompt=1,
-        generator=torch.Generator(device=pipe.transformer.device).manual_seed(random_seed),
+        generator=torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(random_seed),
         output_type='pt',
         image_embed_interleave=4,
         frame_gap=48,
@@ -263,6 +325,9 @@ def process_image_and_text(condition_image, target_prompt, condition_image_promp
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         video_path = f.name
     imageio.mimsave(video_path, output_images[1:]+[output_images[0]], fps=5)
+
+    peak_memory = torch.cuda.max_memory_allocated(device="cuda")
+    print(f"Peak GPU memory allocated: {peak_memory / 1024**2:.2f} MB")
 
     return output_images[0], video_path
 
@@ -492,7 +557,8 @@ def create_app():
 
 
 if __name__ == "__main__":
-    init_basemodel()
+    vram_optimization = parse_args()
+    init_basemodel(vram_optimization)
     app = create_app()
     app.queue(default_concurrency_limit=1)
     app.launch(debug=True, ssr_mode=False, max_threads=1)

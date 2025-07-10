@@ -867,8 +867,8 @@ class HunyuanVideoImageToVideoPipeline(DiffusionPipeline, HunyuanVideoLoraLoader
         guidance = None
         if self.transformer.config.guidance_embeds:
             guidance = (
-                torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device) * 1000.0
-            )
+                torch.tensor([guidance_scale] * latents.shape[0], dtype=torch.float32, device=device) * 1000.0
+            ).to(transformer_dtype)
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order

@@ -515,7 +515,7 @@ class HunyuanVideoTokenRefiner(nn.Module):
         else:
             original_dtype = hidden_states.dtype
             mask_float = attention_mask.float().unsqueeze(-1)
-            pooled_projections = (hidden_states * mask_float).sum(dim=1) / mask_float.sum(dim=1)
+            pooled_projections = (hidden_states.to(torch.float32) * mask_float).sum(dim=1) / mask_float.sum(dim=1)
             pooled_projections = pooled_projections.to(original_dtype)
 
         temb = self.time_text_embed(timestep, pooled_projections)

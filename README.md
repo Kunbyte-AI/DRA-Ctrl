@@ -14,13 +14,15 @@ by *Hengyuan Cao, Yutong Feng, Biao Gong, Yijing Tian, Yunhong Lu, Chuang Liu, a
 [![GitHub](https://img.shields.io/badge/GitHub-Repo-black)](https://github.com/Kunbyte-AI/DRA-Ctrl)
 
 ## Updates
+[2025-07-10] When the model is not in use, move it to the CPU to reduce GPU memory usage, and apply quantization to further decrease memory requirements. Now our work should be able to run on consumer-grade GPUs. For specific usage, please refer to the [Get Started](#get-started) section below. Please note:​​ You need to **check the requirements.txt** file to update environment dependencies, as this ensures the new features will function properly.
+
 [2025-07-01] Added a new Gradio app (gradio_app_hf.py) designed similarly to our HuggingFace Space, making it easier to switch tasks, adjust parameters, and directly test examples. The previous Gradio app (gradio_app.py) will remain unchanged.
 
 ## ✅ TODOs
 
 - [x] release code
 - [x] release checkpoints
-- [ ] use quantized version to save VRAM
+- [x] use quantized version to save VRAM
 - [ ] using FramePack as base model
 
 ## 🔍 Introduction
@@ -77,17 +79,33 @@ DRA-Ctrl/
 ```
 
 ### Get Started
+To reduce GPU memory requirements, we provide a parameter `vram_optimization` to specify different levels of memory optimization schemes. The specific parameters and their meanings are as follows:
+
+`No_Optimization`: No optimization is applied, and **48GB** of VRAM is sufficient to run the code.
+
+`HighRAM_HighVRAM`: No more than **20GB** of VRAM is required.
+
+`HighRAM_LowVRAM`: No more than **8GB** of VRAM is required.
+
+`LowRAM_HighVRAM`: No more than **20GB** of VRAM is required.
+
+`LowRAM_LowVRAM`: No more than **8GB** of VRAM is required.
+
+`VerylowRAM_LowVRAM`: No more than **8GB** of VRAM is required.
+
+**Note**: Reduced resources will lead to increased generation time.
+
+```
+python gradio_app_hf.py --vram_optimization SET_YOUR_OPTIMIZATION_SCHEME_HERE
+```
+
+Here is the command to run the legacy Gradio app, ​which we **do not recommend using**. For easier switching between tasks, adjusting parameters, testing examples, and better VRAM optimization, please use the command above.
 
 ```
 python gradio_app.py --config configs/gradio.yaml
 ```
-For easier switching between tasks, adjusting parameter, and testing examples, please use
-```
-python gradio_app_hf.py
-```
 
-
-For easier testing, in ​spatially-aligned image generation tasks, when passing the condition image to `gradio_app`, there's no need to manually input edge maps, depth maps, or other condition images - only the original image is required. The corresponding condition images will be automatically extracted.
+In ​spatially-aligned image generation tasks, when passing the condition image to `gradio_app`, there's no need to manually input edge maps, depth maps, or other condition images - only the original image is required. The corresponding condition images will be automatically extracted.
 
 You can use the `*_test.jpg` or `*_test.png` images from the assets folder as ​condition images​ for input to `gradio_app`, which will generate the following examples:
 
