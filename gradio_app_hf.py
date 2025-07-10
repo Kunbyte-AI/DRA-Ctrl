@@ -84,7 +84,7 @@ def init_basemodel(vram_optimization):
     # init models
     device = "cuda" if torch.cuda.is_available() else "cpu"
     weight_dtype = torch.bfloat16
-    i2v_model_root = '/data/home/caohengyuan/iLego_chy/cache/HunyuanVideo-I2V' # 'ckpts/HunyuanVideo-I2V'
+    i2v_model_root = 'ckpts/HunyuanVideo-I2V'
     transformer = HunyuanVideoTransformer3DModel.from_pretrained(f'{i2v_model_root}/transformer', 
                                                                  inference_subject_driven=False, 
                                                                  low_cpu_mem_usage=True, 

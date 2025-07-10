@@ -50,6 +50,7 @@
 # Huggingface / quanto for their very useful quantizer
 # gau-nernst for his Pinnig RAM samples
 
+# Modified from https://github.com/deepbeepmeep/mmgp/blob/main/src/mmgp/offload.py
 
 #
 
