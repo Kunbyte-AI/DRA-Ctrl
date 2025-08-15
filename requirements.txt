@@ -1,5 +1,5 @@
-# torch==2.4.1+cu124
-# torchvision==0.19.1+cu124
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124
 torch==2.6.0
 torchvision==0.21.0
 diffusers==0.34.0
@@ -10,4 +10,4 @@ omegaconf
 peft
 opencv-python
 imageio[ffmpeg]
-mmgp
+mmgp==3.5.1
